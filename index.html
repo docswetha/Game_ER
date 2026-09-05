@@ -86,7 +86,7 @@
        ===================================================================== */
     const GAME = {
       phase: 'WELCOME',
-      observeTime: 30,
+      observeTime: 20,
       score: 0, decisionsCorrect: 0, decisionsTotal: 0,
       startTime: null,
       decomp: { stage: null, site: null },
@@ -130,6 +130,17 @@
       if (old) old.parentNode.removeChild(old);
     }
 
+    /* Fisher-Yates: randomize option order inside a panel so the correct
+       answer is never predictably at the top. Order of STAGES is unchanged. */
+    function shuffled(arr) {
+      const a = arr.slice();
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    }
+
     function makePanel(id, title, pos, buttons, width, closable) {
       clearPanel(id);
       if (closable === undefined) closable = true;
@@ -138,10 +149,25 @@
       const titleLines = title.split('\n').length;
       const titleH = 0.10 + titleLines * 0.075;
       const H = titleH + buttons.length * rowH + 0.12;
-      const scene = document.querySelector('a-scene');
+
+      /* pos === 'hud' -> panel rides the camera and appears just above the
+         HUD, so it is always in view wherever the doctor is standing.
+         Used for the room-level panels (welcome, results, debrief).      */
+      const hudMode = (pos === 'hud');
+      const parent = hudMode
+        ? document.querySelector('#hud-anchor')
+        : document.querySelector('a-scene');
+
       const panel = document.createElement('a-entity');
       panel.setAttribute('id', id);
-      panel.setAttribute('position', pos);
+      if (hudMode) {
+        // scale the world-sized panel down to comfortable near-field size
+        const s = 0.30;
+        panel.setAttribute('scale', s + ' ' + s + ' ' + s);
+        panel.setAttribute('position', '0 ' + (0.16 + (H * s) / 2) + ' 0');
+      } else {
+        panel.setAttribute('position', pos);
+      }
 
       const border = document.createElement('a-plane');
       border.setAttribute('width', W + 0.04); border.setAttribute('height', H + 0.04);
@@ -213,7 +239,7 @@
         panel.appendChild(closeBtn);
       }
 
-      scene.appendChild(panel);
+      parent.appendChild(panel);
       refreshRaycasters();
       return panel;
     }
@@ -236,7 +262,7 @@
         'Three patients have just arrived in your ER.\n' +
         'Assess them. Prioritize wisely. Act fast.\n' +
         'Every second you delay, someone gets worse.',
-        '0 1.75 -1.8',
+        'hud',
         [{ label: '>>> BEGIN SHIFT <<<', color: '#1f6e2a', onClick: () => {
             AudioEngine.init();
             AudioEngine.loadMonitor('assets/icu.mp3')
@@ -257,7 +283,7 @@
       GAME.phase = 'PRIORITIZE';
       updateHUD();
       setMessage('Choose which patient to attend FIRST!');
-      makePanel('panel-priority', 'WHICH PATIENT WILL YOU ATTEND FIRST?', '0 1.7 -1.4', [
+      makePanel('panel-priority', 'WHICH PATIENT WILL YOU ATTEND FIRST?', 'hud', [
         { label: 'Bed 1 - Ravi (chest injury)',  onClick: () => pickFirst('patientA') },
         { label: 'Bed 2 - Meena (thigh injury)', onClick: () => pickFirst('patientB') },
         { label: 'Bed 3 - Arjun (ankle injury)', onClick: () => pickFirst('patientC') }
@@ -302,6 +328,7 @@
       if (GAME.phase !== 'TREAT') return;
       const p = GAME.patients[pid];
       if (p.dead) { setMessage(p.label + ' has died.'); return; }
+      if (p.stage !== 'done') clearMoveOn();   // they moved on - stop nagging
       if (p.stage === 'triage')         showTriagePanel(pid);
       else if (p.stage === 'examine')   showExamPanel(pid);
       else if (p.stage === 'orders')    showOrdersPanel(pid);
@@ -339,59 +366,65 @@
     const examConfig = {
       patientA: {
         exams: [
-          { label: 'Auscultate chest',   finding: 'ABSENT breath sounds on the RIGHT.' },
-          { label: 'Check trachea',      finding: 'Trachea DEVIATED to the LEFT.' },
-          { label: 'Look at neck veins', finding: 'Neck veins DISTENDED.' },
-          { label: 'Percuss chest',      finding: 'HYPERRESONANT right hemithorax.' }
+          { label: 'Auscultate chest',      finding: 'ABSENT breath sounds on the RIGHT.' },
+          { label: 'Percuss chest',         finding: 'HYPERRESONANT right hemithorax.' },
+          { label: 'Check trachea',         finding: 'Trachea DEVIATED to the LEFT.' },
+          { label: 'Look at neck veins',    finding: 'Neck veins DISTENDED.' },
+          { label: 'Listen to heart sounds',finding: 'Heart sounds present, not muffled. Tachycardic.' },
+          { label: 'Palpate radial pulses', finding: 'Radial pulses palpable but thready in BOTH arms.' }
         ],
         dxTitle: 'DIAGNOSIS?\nStab wound + your findings',
         dx: [
           { label: 'Tension pneumothorax', correct: true,
-            why: 'Absent breath sounds + tracheal deviation AWAY + distended neck veins + hyperresonance + shock = tension pneumothorax.' },
-          { label: 'Cardiac tamponade', correct: false,
-            why: 'Tamponade gives muffled heart sounds and distended neck veins, but breath sounds are normal and percussion is not hyperresonant.' },
+            why: 'Absent breath sounds + hyperresonance + tracheal deviation AWAY + distended neck veins + shock. The haemodynamic compromise is what makes it TENSION rather than simple.' },
+          { label: 'Simple pneumothorax', correct: false,
+            why: 'A simple pneumothorax gives absent breath sounds and hyperresonance too - but NOT tracheal deviation, distended neck veins or shock. Those three make this a tension pneumothorax needing decompression NOW.' },
           { label: 'Massive haemothorax', correct: false,
-            why: 'Haemothorax is DULL to percussion (blood), with FLAT neck veins from blood loss - opposite of these findings.' },
-          { label: 'Simple rib fracture', correct: false,
-            why: 'A simple rib fracture does not cause absent breath sounds, tracheal shift or shock.' }
+            why: 'Haemothorax is DULL to percussion (blood, not air) and neck veins are FLAT from blood loss. His chest is hyperresonant and his neck veins are distended - the opposite picture.' },
+          { label: 'Cardiac tamponade', correct: false,
+            why: 'Tamponade also gives distended neck veins and shock, but heart sounds are MUFFLED and breath sounds and percussion are NORMAL. His breath sounds are absent and his chest is hyperresonant.' }
         ]
       },
       patientB: {
         exams: [
-          { label: 'Look at the limb',      finding: 'Right thigh swollen, deformed, SHORTENED.' },
-          { label: 'Feel distal pulses',    finding: 'Foot pulses PRESENT, foot warm & pink. Neurovascular intact.' },
-          { label: 'Ask her to lift leg',   finding: 'Unable to lift. Severe pain on any movement.' },
-          { label: 'Compress the pelvis',   finding: 'Pelvis STABLE, non-tender.' }
+          { label: 'Look at the limb',       finding: 'Right thigh swollen, deformed, SHORTENED. Skin intact.' },
+          { label: 'Feel distal pulses',     finding: 'Dorsalis pedis and posterior tibial PRESENT, foot warm and pink.' },
+          { label: 'Check sensation in foot',finding: 'Sensation intact throughout the foot.' },
+          { label: 'Examine the hip',        finding: 'Hip not flexed or internally rotated. Deformity is MID-THIGH.' },
+          { label: 'Compress the pelvis',    finding: 'Pelvis STABLE and non-tender.' },
+          { label: 'Repeat blood pressure',  finding: 'BP trending down slightly. Thigh circumference increasing.' }
         ],
-        dxTitle: 'DIAGNOSIS?\nRTA + your findings',
+        dxTitle: 'DIAGNOSIS?\nRoad traffic accident + your findings',
         dx: [
-          { label: 'Femoral shaft fracture', correct: true,
-            why: 'Shortened, deformed, swollen thigh after high-energy trauma = femur fracture. Always check distal pulses - and recheck after splinting.' },
-          { label: 'Hip dislocation', correct: false,
-            why: 'Hip dislocation classically gives a flexed, ADDucted, internally rotated limb - not mid-thigh deformity.' },
+          { label: 'Closed femoral shaft fracture', correct: true,
+            why: 'Shortened, swollen, deformed mid-thigh after high-energy trauma, with intact distal neurovascular status and a stable pelvis. Note the falling BP: a femur can bleed 1-1.5 L into the thigh.' },
+          { label: 'Femoral fracture with vascular injury', correct: false,
+            why: 'Clinically very close - and you must ALWAYS exclude it. But you documented present dorsalis pedis and posterior tibial pulses with a warm, pink foot. Without that examination you could not have ruled this out.' },
+          { label: 'Posterior hip dislocation', correct: false,
+            why: 'Also shortens the limb - but classically flexed, ADDucted and internally rotated at the HIP. Her hip examination is normal and the deformity is mid-shaft.' },
           { label: 'Pelvic fracture', correct: false,
-            why: 'Her pelvis is stable and non-tender on examination.' },
-          { label: 'Knee ligament injury', correct: false,
-            why: 'Deformity is in the thigh, not the knee, and ligament injuries do not shorten the limb.' }
+            why: 'Also causes shortening and shock after high-energy trauma, but her pelvis is stable and non-tender on compression.' }
         ]
       },
       patientC: {
         exams: [
-          { label: 'Look at the ankle',        finding: 'Mild swelling below the LATERAL malleolus.' },
-          { label: 'Palpate the malleoli',     finding: 'NO bony tenderness over either malleolus.' },
-          { label: 'Ask him to walk 4 steps',  finding: 'Walks 4 steps with a mild limp.' },
-          { label: 'Feel distal pulses',       finding: 'Pulses normal, foot warm, sensation intact.' }
+          { label: 'Inspect the ankle',            finding: 'Swelling and bruising BELOW and ANTERIOR to the lateral malleolus.' },
+          { label: 'Palpate posterior malleoli',   finding: 'NO tenderness over the posterior edge or tip of either malleolus.' },
+          { label: 'Palpate base of 5th metatarsal',finding: 'NON-tender. Navicular also non-tender.' },
+          { label: 'Squeeze test (syndesmosis)',   finding: 'NEGATIVE. No tenderness above the joint line.' },
+          { label: 'Ask him to walk 4 steps',      finding: 'Walks 4 steps unaided with a mild limp.' },
+          { label: 'Test ankle movements',         finding: 'Pain on inversion. Plantarflexion strength normal, no palpable gap in the Achilles.' }
         ],
-        dxTitle: 'DIAGNOSIS?\nTwisted ankle + your findings',
+        dxTitle: 'DIAGNOSIS?\nInversion injury + your findings',
         dx: [
-          { label: 'Lateral ankle sprain', correct: true,
-            why: 'No malleolar bony tenderness + able to weight-bear 4 steps = Ottawa ankle rules NEGATIVE. Clinical sprain, no X-ray needed.' },
-          { label: 'Ankle fracture', correct: false,
-            why: 'Ottawa rules: fracture needs malleolar bony tenderness OR inability to bear weight. He has neither.' },
-          { label: 'Achilles tendon rupture', correct: false,
-            why: 'Achilles rupture presents with a palpable gap and inability to plantarflex - swelling is behind the ankle, not lateral.' },
-          { label: 'Compartment syndrome', correct: false,
-            why: 'Compartment syndrome gives pain out of proportion, tense swelling and later pulse changes - not a mild swelling with normal pulses.' }
+          { label: 'Lateral ligament (ATFL) sprain', correct: true,
+            why: 'Ottawa ankle AND foot rules are NEGATIVE: no posterior malleolar tenderness, no 5th metatarsal or navicular tenderness, and he can weight-bear 4 steps. Negative squeeze test excludes a high ankle sprain. This is a clinical sprain - no imaging indicated.' },
+          { label: 'Weber A distal fibular fracture', correct: false,
+            why: 'An avulsion fracture at the lateral malleolus presents almost identically - which is exactly why the Ottawa rules exist. It requires bony tenderness over the posterior edge or tip of the malleolus. He has none.' },
+          { label: 'Base of 5th metatarsal fracture', correct: false,
+            why: 'The same inversion mechanism commonly causes this, and it is easily missed if you only examine the ankle. But you palpated the 5th metatarsal base and it was non-tender.' },
+          { label: 'Syndesmotic (high ankle) sprain', correct: false,
+            why: 'Would give tenderness ABOVE the joint line and a positive squeeze test, and typically follows external rotation rather than inversion. His squeeze test is negative.' }
         ]
       }
     };
@@ -416,7 +449,7 @@
 
     function showDiagnosisPanel(pid) {
       const cfg = examConfig[pid];
-      const buttons = cfg.dx.map(d => ({
+      const buttons = shuffled(cfg.dx).map(d => ({
         label: d.label,
         onClick: () => {
           if (d.correct) {
@@ -438,38 +471,68 @@
     /* =====================================================================
        PHASE 4 — NURSE ORDERS (per-order explanations)
        ===================================================================== */
+    /* severity: 'harmful' = -10 (actively dangerous), 'excess' = -3
+       (not dangerous, but wasteful / unnecessary in this patient).      */
     const ordersConfig = {
       patientA: {
-        title: 'NURSE ORDERS - Ravi\n(select all needed, then confirm)',
+        title: 'NURSE ORDERS - Ravi\n(select all that apply, then confirm)',
         options: [
-          { label: 'High-flow oxygen',           correct: true,  why: 'He is severely hypoxic - oxygen buys time while you prepare.' },
-          { label: 'IV access + monitor vitals', correct: true,  why: 'Anticipate deterioration; access before collapse.' },
-          { label: 'Prepare decompression kit',  correct: true,  why: 'Tension pneumothorax needs immediate needle decompression.' },
-          { label: 'Call surgery team',          correct: true,  why: 'He will need a chest drain (definitive) after the needle.' },
-          { label: 'Painkillers only',           correct: false, why: 'Masks symptoms while the pneumothorax keeps tensioning - fatal.' },
-          { label: 'Discharge home',             correct: false, why: 'He is peri-arrest. Discharge would be lethal.' }
+          { label: 'High-flow oxygen, non-rebreather',   correct: true,
+            why: 'He is profoundly hypoxic. Oxygen buys time while you prepare to decompress.' },
+          { label: 'Two large-bore IVs + full monitoring',correct: true,
+            why: 'Obtain access BEFORE he collapses; continuous monitoring tracks the response to decompression.' },
+          { label: 'Prepare needle decompression kit',    correct: true,
+            why: 'Tension pneumothorax is treated immediately at the bedside - the kit must be ready before you start.' },
+          { label: 'Alert surgery for chest drain',       correct: true,
+            why: 'The needle is temporizing only. Definitive management is an intercostal drain, so the team must be moving now.' },
+          { label: 'Portable chest X-ray before treating',correct: false, severity: 'harmful',
+            why: 'The classic trap. Tension pneumothorax is a CLINICAL diagnosis - waiting for a film costs minutes he does not have. Imaging is appropriate only for a stable pneumothorax.' },
+          { label: 'Intubate and ventilate now',          correct: false, severity: 'harmful',
+            why: 'Tempting because he is hypoxic - but positive-pressure ventilation forces more air into the pleural space and can precipitate arrest. Decompress FIRST.' },
+          { label: 'CT chest for full trauma survey',     correct: false, severity: 'excess',
+            why: 'An unstable patient does not go to the scanner. Resuscitate first; image later if still indicated.' },
+          { label: 'IV morphine for pain',                correct: false, severity: 'harmful',
+            why: 'Opioids depress respiration in a peri-arrest hypoxic patient. Treat the cause of his distress, not the sensation.' }
         ]
       },
       patientB: {
-        title: 'NURSE ORDERS - Meena\n(select all needed, then confirm)',
+        title: 'NURSE ORDERS - Meena\n(select all that apply, then confirm)',
         options: [
-          { label: 'IV line + fluids',        correct: true,  why: 'A femur fracture can bleed 1-1.5 LITRES internally.' },
-          { label: 'Analgesia (pain relief)', correct: true,  why: 'Severe pain - analgesia is humane and lowers physiological stress.' },
-          { label: 'Immobilize limb',         correct: true,  why: 'Reduces pain, bleeding and fat embolism risk.' },
-          { label: 'X-ray right femur',       correct: true,  why: 'Confirms fracture pattern and plans fixation.' },
-          { label: 'Prepare chest tube',      correct: false, why: 'She has no chest pathology - wrong patient, wrong problem.' },
-          { label: 'Discharge home',          correct: false, why: 'An unfixed femur fracture cannot go home.' }
+          { label: 'Two large-bore IVs + warmed fluids',  correct: true,
+            why: 'A closed femoral shaft fracture can sequester 1-1.5 litres of blood into the thigh.' },
+          { label: 'Titrated IV analgesia',               correct: true,
+            why: 'Severe pain warrants adequate, titrated analgesia - it is humane and reduces the physiological stress response.' },
+          { label: 'Immobilise the limb',                 correct: true,
+            why: 'Reduces pain, further blood loss and the risk of fat embolism.' },
+          { label: 'X-ray femur incl. joint above & below',correct: true,
+            why: 'Standard practice: always image the joint above and below a long-bone fracture.' },
+          { label: 'Group and crossmatch',                correct: true,
+            why: 'Anticipates transfusion given the potential blood loss and likely operative fixation.' },
+          { label: 'Recheck distal pulses after splinting',correct: true,
+            why: 'Neurovascular status MUST be documented before and after any manipulation or splinting.' },
+          { label: 'CT angiogram of the limb',            correct: false, severity: 'excess',
+            why: 'Not indicated when distal pulses are present and the foot is warm and pink. Reserve for suspected vascular injury.' },
+          { label: 'Oral analgesia only',                 correct: false, severity: 'excess',
+            why: 'Inadequate for a femoral shaft fracture, and unreliable absorption in a shocked patient.' }
         ]
       },
       patientC: {
-        title: 'NURSE ORDERS - Arjun\n(select all needed, then confirm)',
+        title: 'NURSE ORDERS - Arjun\n(select all that apply, then confirm)',
         options: [
-          { label: 'Ice pack + elevation',     correct: true,  why: 'Reduces swelling and pain - the R-I-C-E principle.' },
-          { label: 'Crepe bandage / dressing', correct: true,  why: 'Compression supports the sprained ligaments.' },
-          { label: 'Oral analgesics',          correct: true,  why: 'Simple analgesia is sufficient for a sprain.' },
-          { label: 'X-ray ankle',              correct: false, why: 'Ottawa ankle rules NEGATIVE - no bony tenderness, can weight-bear. X-ray adds radiation and cost for nothing.' },
-          { label: 'Prepare intubation',       correct: false, why: 'His airway is fine - he is chatting with you.' },
-          { label: 'Urgent CT scan',           correct: false, why: 'No indication - clinical diagnosis is sufficient.' }
+          { label: 'Ice and elevation',                   correct: true,
+            why: 'Reduces swelling and pain in the acute phase.' },
+          { label: 'Elastic compression support',         correct: true,
+            why: 'Supports the injured lateral ligaments and limits swelling.' },
+          { label: 'Oral NSAID analgesia',                correct: true,
+            why: 'Simple oral analgesia is sufficient for a ligamentous sprain.' },
+          { label: 'X-ray ankle',                         correct: false, severity: 'excess',
+            why: 'Ottawa ankle rules are NEGATIVE. Imaging here adds radiation, cost and department time with no change in management.' },
+          { label: 'X-ray foot',                          correct: false, severity: 'excess',
+            why: 'Ottawa foot rules are also negative - no 5th metatarsal or navicular tenderness, and he can weight-bear.' },
+          { label: 'IV opioid analgesia',                 correct: false, severity: 'excess',
+            why: 'Disproportionate for a sprain, and exposes him to unnecessary risk in a patient who can go home.' },
+          { label: 'Orthopaedic referral today',          correct: false, severity: 'excess',
+            why: 'A simple lateral sprain is managed in primary care with return advice. Referral consumes a slot another patient needs.' }
         ]
       }
     };
@@ -477,15 +540,18 @@
     function showOrdersPanel(pid) {
       const cfg = ordersConfig[pid];
       const selections = new Set();
-      const buttons = cfg.options.map((opt, idx) => ({
+      // shuffle the ORDER ITEMS inside the panel so position never hints at
+      // the answer; the sequence of stages is unchanged.
+      const shuffledOpts = shuffled(cfg.options);
+      const buttons = shuffledOpts.map((opt) => ({
         label: opt.label,
         onClick: (btn) => {
-          if (selections.has(idx)) {
-            selections.delete(idx);
+          if (selections.has(opt)) {
+            selections.delete(opt);
             btn.dataset.selected = 'false';
             btn.setAttribute('color', btn.dataset.basecolor);
           } else {
-            selections.add(idx);
+            selections.add(opt);
             btn.dataset.selected = 'true';
             btn.setAttribute('color', '#3fa06a');
           }
@@ -502,24 +568,35 @@
       const cfg = ordersConfig[pid];
       const pname = GAME.patients[pid].label;
       let pts = 0, rightPicks = 0, totalRight = 0, issues = 0;
-      cfg.options.forEach((opt, idx) => {
-        const picked = selections.has(idx);
+      let harmful = 0, excess = 0;
+      cfg.options.forEach((opt) => {
+        const picked = selections.has(opt);
         if (opt.correct) totalRight++;
         if (picked) {
-          pts += opt.correct ? 5 : -5;
-          if (opt.correct) rightPicks++;
-          else { issues++; logDebrief('Order - ' + pname + ': ' + opt.label, false, opt.why); }
+          if (opt.correct) { pts += 5; rightPicks++; }
+          else {
+            // graded penalty: actively dangerous costs far more than wasteful
+            if (opt.severity === 'harmful') { pts -= 10; harmful++; }
+            else                            { pts -= 3;  excess++; }
+            issues++;
+            logDebrief('Order - ' + pname + ': ' + opt.label, false,
+              (opt.severity === 'harmful' ? '[HARMFUL] ' : '[UNNECESSARY] ') + opt.why);
+          }
         } else if (opt.correct) {
           issues++;
           logDebrief('Missed order - ' + pname + ': ' + opt.label, false, opt.why);
         }
       });
-      if (issues === 0) logDebrief('Nurse orders - ' + pname, true, 'All correct orders given, nothing harmful or unnecessary.');
+      if (issues === 0) logDebrief('Nurse orders - ' + pname, true,
+        'All indicated orders given, nothing harmful and nothing wasteful.');
       const isGood = rightPicks >= Math.ceil(totalRight * 0.75) && pts > 0;
       addScore(pts, isGood);
       GAME.patients[pid].stage = 'procedure';
+      let note = '';
+      if (harmful) note += ' ' + harmful + ' potentially HARMFUL order(s).';
+      if (excess)  note += ' ' + excess + ' unnecessary order(s).';
       setMessage('Orders: ' + (pts >= 0 ? '+' : '') + pts +
-        (issues ? '. ' + issues + ' issue(s) - explained in your debrief.' : '. Flawless!'));
+        (issues ? '.' + note + ' See debrief.' : '. Flawless!'));
       showProcedurePanel(pid);   // panel updates in place, no re-click needed
     }
 
@@ -529,40 +606,73 @@
     function showProcedurePanel(pid) {
       if (pid === 'patientA') return decompressionRouter();
       if (pid === 'patientB') return showSplintChoice();
-      if (pid === 'patientC') {
-        makePanel('panel-flow', 'TREATMENT - Arjun', bedPanelPos.patientC, [
-          { label: 'RICE advice + discharge with analgesia', onClick: () => {
-              clearPanel('panel-flow');
-              addScore(10, true);
-              logDebrief('Disposition - Arjun', true, 'Ottawa-negative sprain: RICE, analgesia, discharge with return advice.');
-              finishPatient('patientC', 'Discharged safely! +10. Rest, Ice, Compression, Elevation.');
-            } },
-          { label: 'Admit to ICU for observation', onClick: () => {
-              addScore(-10, false);
-              logDebrief('Disposition - Arjun', false, 'ICU admission for a sprain wastes a critical-care bed and exposes him to hospital risks.');
-              setMessage('Wrong: -10. A sprain does not need ICU. It blocks a bed someone else may die waiting for.');
-            } }
-        ], 1.9);
-      }
+      if (pid === 'patientC') return showDischargeChoice();
     }
 
-    /* ---------- SPLINT SELECTION (Meena) ---------- */
+    /* ---------- DISCHARGE PLAN (Arjun) - all four are plausible plans ---------- */
+    const dischargeOptions = [
+      { label: 'RICE + weight-bear as tolerated + support + NSAID + return advice',
+        correct: true,
+        why: 'Current guidance for a Grade I-II lateral sprain: early protected mobilisation recovers faster than immobilisation. Return advice covers the small miss rate of the Ottawa rules.' },
+      { label: 'Below-knee cast, non-weight-bearing for 6 weeks',
+        correct: false,
+        why: 'The "safe over-treatment" trap. Casting a simple sprain causes joint stiffness, muscle wasting and a slower return to function - and carries VTE risk. Over-treatment is still harm.' },
+      { label: 'Complete rest with crutches, no weight-bearing for 2 weeks',
+        correct: false,
+        why: 'Milder version of the same error. Prolonged non-weight-bearing delays recovery; the evidence favours early mobilisation within the limits of pain.' },
+      { label: 'X-ray first, then RICE and discharge',
+        correct: false,
+        why: 'Ottawa ankle and foot rules are both negative, so the X-ray changes nothing. It adds radiation, cost and department time - the definition of an unnecessary investigation.' }
+    ];
+
+    function showDischargeChoice() {
+      const buttons = shuffled(dischargeOptions).map(o => ({
+        label: o.label,
+        onClick: () => {
+          if (o.correct) {
+            addScore(10, true);
+            logDebrief('Disposition - Arjun', true, o.why);
+            clearPanel('panel-flow');
+            finishPatient('patientC', 'Discharged appropriately! +10. Early mobilisation with return advice.');
+          } else {
+            addScore(-5, false);
+            logDebrief('Disposition - Arjun', false, 'Chose: ' + o.label + '. ' + o.why);
+            setMessage('Not the best plan: -5. ' + o.why);
+          }
+        }
+      }));
+      makePanel('panel-flow', 'DISCHARGE PLAN - Arjun\nWhich plan will you give him?',
+                bedPanelPos.patientC, buttons, 2.3);
+    }
+
+    /* ---------- SPLINT (Meena) - all four are real lower-limb devices ---------- */
+    const splintOptions = [
+      { label: 'Thomas / traction splint', correct: true,
+        why: 'A femoral shaft fracture needs TRACTION: it realigns the shaft, controls the proximal fragment against powerful thigh muscle pull, and reduces bleeding into the thigh and pain.' },
+      { label: 'Long-leg posterior (above-knee) slab', correct: false,
+        why: 'A real and useful device - it does immobilise the limb, but applies NO traction, so the femoral fragments stay overriding under muscle pull and continue to bleed.' },
+      { label: 'Vacuum / box splint', correct: false,
+        why: 'Genuine prehospital lower-limb splint and comfortable for tibial injuries, but again provides no traction and does not control a mid-shaft femoral fracture.' },
+      { label: 'Pelvic binder', correct: false,
+        why: 'Correct device for the WRONG diagnosis. Her pelvis is stable and non-tender on examination; a binder does nothing for a mid-shaft femoral fracture.' }
+    ];
+
     function showSplintChoice() {
-      makePanel('panel-flow', 'SELECT THE CORRECT SPLINT\nMid-shaft femur fracture', bedPanelPos.patientB, [
-        { label: 'Thomas / traction splint', onClick: () => applySplint() },
-        { label: 'Buddy strapping', onClick: () => {
+      const buttons = shuffled(splintOptions).map(o => ({
+        label: o.label,
+        onClick: () => {
+          if (o.correct) {
+            logDebrief('Splint - Meena', true, o.why);
+            applySplint();
+          } else {
             addScore(-10, false);
-            logDebrief('Splint choice', false, 'Buddy strapping is for fingers and toes - useless for a femur.');
-            setMessage('Wrong: -10. Buddy strapping is for fingers/toes.'); } },
-        { label: 'Cervical collar', onClick: () => {
-            addScore(-10, false);
-            logDebrief('Splint choice', false, 'A cervical collar immobilizes the neck, not the femur.');
-            setMessage('Wrong: -10. That is for the neck, not the femur.'); } },
-        { label: 'Below-knee back slab', onClick: () => {
-            addScore(-10, false);
-            logDebrief('Splint choice', false, 'A below-knee slab does not cross the fracture - a splint must immobilize the joint above and below.');
-            setMessage('Wrong: -10. It does not even reach the fracture. Immobilize joint above AND below.'); } }
-      ], 2.0);
+            logDebrief('Splint - Meena', false, 'Chose: ' + o.label + '. ' + o.why);
+            setMessage('Not the right splint: -10. ' + o.why);
+          }
+        }
+      }));
+      makePanel('panel-flow', 'SELECT THE SPLINT\nMid-shaft femoral fracture',
+                bedPanelPos.patientB, buttons, 2.3);
     }
 
     function applySplint() {
@@ -602,14 +712,18 @@
 
     const TOOLS = { held: null, heldType: null, cleaned: false, origParent: null, origPos: null };
 
+    /* Neutral prompt - the game asks, it never names the tool. The player must
+       recall the correct sequence (asepsis before puncture) themselves. */
+    const ASK = "What's your next step? Select the suitable one from the tray.";
+
     function decompressionRouter() {
       const st = GAME.decomp.stage;
       if (!st || st === 'help') return decompStepHelp();
       if (st === 'oxygen')      return decompStepOxygen();
       if (st === 'position')    return decompStepPosition();
       if (st === 'site')        return setMessage('Aim at the correct site on his chest and pull the trigger!');
-      if (st === 'clean')       return setMessage('Grab the SWAB from the tray (trigger), then aim at the green target and pull the trigger again to wipe.');
-      if (st === 'insert')      return setMessage('Grab the 14G CANNULA from the tray (trigger), then aim at the green target and pull the trigger again to insert.');
+      if (st === 'clean')       return setMessage("What's your next step? Select the suitable one from the tray.");
+      if (st === 'insert')      return setMessage("What's your next step? Select the suitable one from the tray.");
       if (st === 'secure')      return decompStepSecure();
     }
 
@@ -646,12 +760,17 @@
 
     function spawnSiteTargets() {
       const pA = document.querySelector('#patientA');
+      // The generous body hit-volume would sit in front of the chest reticles
+      // and swallow their clicks, so stand it down while targeting is active.
+      const catcher = pA.querySelector('[patient-select]');
+      if (catcher) catcher.setAttribute('visible', 'false'), catcher.classList.remove('clickable');
       decompSites.forEach(s => {
         const t = document.createElement('a-entity');
         t.setAttribute('id', s.id);
         t.setAttribute('position', s.pos);
         t.setAttribute('rotation', s.rot);
         t.innerHTML = `
+          <a-circle class="clickable" radius="0.085" opacity="0.001" material="transparent: true"></a-circle>
           <a-ring class="clickable" color="#ff4444" radius-inner="0.028" radius-outer="0.045"
                   animation="property: scale; from: 1 1 1; to: 1.25 1.25 1.25; dir: alternate; loop: true; dur: 600"></a-ring>
           <a-circle class="clickable" color="#ffffff" radius="0.012" position="0 0 0.001"></a-circle>
@@ -680,7 +799,7 @@
             else el.querySelector('a-ring').setAttribute('color', '#3fff7a');
           });
           spawnProcedureTray();
-          setMessage('Site confirmed! +20. STEP 5: Grab the SWAB from the tray, aim at the green target, and pull the trigger to wipe.');
+          setMessage("Site confirmed! +20. " + ASK);
         } else {
           addScore(-15, false);
           const why = site.id === 'site-sternum'
@@ -704,12 +823,12 @@
         } else if (TOOLS.heldType === 'insulin' || TOOLS.heldType === 'scalpel') {
           wrongToolPenalty();
         } else {
-          setMessage('Grab the SWAB from the tray first, then aim here and pull the trigger.');
+          setMessage("Nothing in your hand. " + ASK);
         }
       } else if (GAME.decomp.stage === 'insert') {
         if (TOOLS.heldType === 'cannula') performInsertion();
         else if (TOOLS.heldType === 'insulin' || TOOLS.heldType === 'scalpel') wrongToolPenalty();
-        else setMessage('Grab the 14G CANNULA from the tray first, then aim here and pull the trigger.');
+        else setMessage("Nothing in your hand. " + ASK);
       }
     }
 
@@ -721,7 +840,7 @@
       if (swab && swab.parentNode) swab.parentNode.removeChild(swab);
       TOOLS.cleaned = true;
       GAME.decomp.stage = 'insert';
-      setMessage('Wiping... Site clean! +5. STEP 6: Grab the 14G CANNULA, aim at the green target, and pull the trigger to insert.');
+      setMessage("Wiping... site is clean. +5. " + ASK);
     }
 
     function wrongToolPenalty() {
@@ -803,12 +922,14 @@
       toolEl.setAttribute('rotation', '-40 0 0');
       TOOLS.held = toolEl;
       TOOLS.heldType = type;
-      if (type === 'swab')    setMessage('Holding the swab. Aim at the green target and pull the trigger to wipe.');
+      if (type === 'swab')    setMessage(GAME.decomp.stage === 'clean'
+        ? 'Good choice - antiseptic swab. Now point at the target on the patient and pull the trigger to disinfect.'
+        : 'The site is already disinfected. ' + ASK);
       if (type === 'cannula') setMessage(TOOLS.cleaned
-        ? 'Holding the 14G cannula. Aim at the green target and pull the trigger to insert.'
-        : 'Holding the cannula - but disinfect the site first!');
+        ? 'Good choice - 14G cannula. Now point at the target on the patient and pull the trigger to insert.'
+        : 'Cannula in hand - but is the site ready for a puncture yet?');
       if (type === 'insulin' || type === 'scalpel')
-        setMessage('Holding the ' + (type === 'insulin' ? 'insulin syringe' : 'scalpel') + '... is this the right tool?');
+        setMessage('You picked up the ' + (type === 'insulin' ? 'insulin syringe' : 'scalpel') + '. Is that what this step needs?');
     }
 
     function returnHeldTool() {
@@ -860,12 +981,41 @@
       ], 2.1);
     }
 
+    /* ---- "you're in an ER, move" nudges ----
+       Once a patient is finished, lingering costs the others time. Escalating
+       prompts fire at 5 / 10 / 15 s and stop as soon as the doctor starts
+       working on someone else (or the shift ends).                        */
+    let MOVE_ON_TIMERS = [];
+    function clearMoveOn() {
+      MOVE_ON_TIMERS.forEach(t => clearTimeout(t));
+      MOVE_ON_TIMERS = [];
+    }
+    function startMoveOn(justFinished) {
+      clearMoveOn();
+      const waiting = Object.keys(GAME.patients)
+        .filter(k => GAME.patients[k].stage !== 'done' && !GAME.patients[k].dead);
+      if (!waiting.length) return;              // nobody left, no nudge
+      const n = waiting.length;
+      const nudges = [
+        [5000,  justFinished + ' is stable and the team is on it. ' +
+                n + ' patient' + (n > 1 ? 's' : '') + ' still waiting.'],
+        [10000, "You're in an ER, doctor. Move."],
+        [15000, "Every second here is a second someone else doesn't have. GO."]
+      ];
+      nudges.forEach(([ms, text]) => {
+        MOVE_ON_TIMERS.push(setTimeout(() => {
+          if (GAME.phase === 'TREAT') setMessage(text);
+        }, ms));
+      });
+    }
+
     function finishPatient(pid, msg) {
       const p = GAME.patients[pid];
       p.stage = 'done';
       p.saved = !p.dead;
       setMessage(msg);
       checkEnd();
+      if (GAME.phase === 'TREAT') startMoveOn(p.label);
     }
 
     /* =====================================================================
@@ -896,7 +1046,7 @@
         '\nTotal time: ' + elapsed + 's' +
         '\nFINAL SCORE: ' + GAME.score +
         '\nRANK: ' + rank,
-        '0 1.8 -1.6',
+        'hud',
         [
           { label: 'VIEW CLINICAL DEBRIEF', color: '#5a3f92', onClick: () => showDebriefPage(0) },
           { label: 'RESTART SIMULATION', onClick: () => location.reload() }
@@ -920,7 +1070,7 @@
         buttons.push({ label: 'Next >', onClick: () => showDebriefPage(page + 1) });
       buttons.push({ label: 'Back to results', onClick: () => { clearPanel('panel-debrief'); showResults(); } });
       buttons.push({ label: 'RESTART SIMULATION', onClick: () => location.reload() });
-      makePanel('panel-debrief', title, '0 1.8 -1.6', buttons, 2.6, false);
+      makePanel('panel-debrief', title, 'hud', buttons, 2.6, false);
     }
 
     /* =====================================================================
@@ -1103,6 +1253,10 @@
         <a-box position="0 0.46 -0.85" width="0.6" height="0.08" depth="0.35" color="#ffffff"></a-box>
 
         <a-entity id="patientA" patient="hr: 128; spo2: 78; bpSys: 88; bpDia: 54; rr: 38; deteriorates: true">
+          <!-- generous invisible hit volume: clicking anywhere near the body works -->
+          <a-box class="clickable" patient-select="pid: patientA"
+                 position="0 0.62 0.1" width="0.95" height="0.55" depth="2.2"
+                 opacity="0.001" material="transparent: true"></a-box>
           <a-sphere class="clickable" patient-select="pid: patientA" position="0 0.55 -0.82" radius="0.115" color="#c8927a"></a-sphere>
           <a-cylinder position="0 0.50 -0.70" rotation="90 0 0" radius="0.045" height="0.10" color="#c8927a"></a-cylinder>
           <a-box class="clickable" patient-select="pid: patientA" breathing="fast: true"
@@ -1152,6 +1306,9 @@
         <a-box position="0 0.46 -0.85" width="0.6" height="0.08" depth="0.35" color="#ffffff"></a-box>
 
         <a-entity id="patientB" patient="hr: 104; spo2: 97; bpSys: 118; bpDia: 76; rr: 20">
+          <a-box class="clickable" patient-select="pid: patientB"
+                 position="0 0.62 0.1" width="0.95" height="0.55" depth="2.2"
+                 opacity="0.001" material="transparent: true"></a-box>
           <a-sphere class="clickable" patient-select="pid: patientB" position="0 0.55 -0.82" radius="0.11" color="#b9835f"></a-sphere>
           <a-sphere position="0 0.62 -0.90" radius="0.06" color="#2b1d12"></a-sphere>
           <a-cylinder position="0 0.50 -0.70" rotation="90 0 0" radius="0.04" height="0.10" color="#b9835f"></a-cylinder>
@@ -1201,6 +1358,9 @@
         <a-box position="0 0.55 -1.0" width="1.1" height="0.5" depth="0.08" color="#8fa5aa"></a-box>
 
         <a-entity id="patientC" patient="hr: 82; spo2: 99; bpSys: 122; bpDia: 78; rr: 14">
+          <a-box class="clickable" patient-select="pid: patientC"
+                 position="0.62 0.75 0.45" width="0.85" height="1.3" depth="0.9"
+                 opacity="0.001" material="transparent: true"></a-box>
           <a-sphere class="clickable" patient-select="pid: patientC" position="0.62 1.12 0.35" radius="0.105" color="#caa284"></a-sphere>
           <a-cylinder position="0.62 1.00 0.35" radius="0.04" height="0.08" color="#caa284"></a-cylinder>
           <a-box class="clickable" patient-select="pid: patientC" breathing
@@ -1254,7 +1414,7 @@
       <a-light type="directional" position="3 5 2" intensity="0.55"></a-light>
 
       <!-- ==================== PLAYER RIG + FACE HUD ==================== -->
-      <a-entity id="rig" movement-controls="speed: 0.18" position="0 0 2">
+      <a-entity id="rig" movement-controls="speed: 0.18" joystick-move position="0 0 2">
         <a-entity camera position="0 1.6 0" look-controls>
           <a-entity id="hud" position="0 -0.30 -0.85" rotation="-12 0 0">
             <a-plane id="hud-border" width="0.56" height="0.245" color="#2a6f85" opacity="0.9"></a-plane>
@@ -1268,6 +1428,12 @@
                     position="0 -0.028 0.006" align="center" color="#eafcff"
                     width="0.55" wrap-count="34" baseline="center"></a-text>
           </a-entity>
+
+          <!-- Room-level panels (welcome / prioritization / results / debrief)
+               are parented here so they pop up just above the status HUD and
+               follow the doctor's view instead of sitting in the middle of
+               the room. Empty until a panel opens. -->
+          <a-entity id="hud-anchor" position="0 -0.24 -0.85" rotation="-12 0 0"></a-entity>
 
           <!-- Desktop-click / mobile-tap reticle: same raycaster + click events as
                the VR laser controllers, but aimed by looking (mouse-drag or phone
@@ -1291,13 +1457,122 @@
         document.querySelector('a-scene').addEventListener('enter-vr', () => {
           const gc = document.querySelector('#gaze-cursor');
           if (gc) gc.setAttribute('visible', 'false');
+          setJoystickVisible(false);
         });
         document.querySelector('a-scene').addEventListener('exit-vr', () => {
           const gc = document.querySelector('#gaze-cursor');
           if (gc) gc.setAttribute('visible', 'true');
+          setJoystickVisible(isTouchDevice());
+        });
+
+        /* ================= MOBILE VIRTUAL JOYSTICK =================
+           Drag the pad to walk in any direction. "Forward" is wherever
+           the camera is looking, so gyroscope turning + joystick walking
+           work together naturally. Touch devices only.               */
+        function isTouchDevice() {
+          return ('ontouchstart' in window) || navigator.maxTouchPoints > 0;
+        }
+        function setJoystickVisible(v) {
+          const z = document.getElementById('joy-zone');
+          const h = document.getElementById('joy-hint');
+          if (z) z.style.display = v ? 'block' : 'none';
+          if (h) h.style.display = v ? 'block' : 'none';
+        }
+
+        const JOY = { active: false, dx: 0, dy: 0, id: null };
+
+        (function initJoystick() {
+          if (!isTouchDevice()) return;      // laptop + headset untouched
+          setJoystickVisible(true);
+
+          const zone = document.getElementById('joy-zone');
+          const knob = document.getElementById('joy-knob');
+          const MAXR = 45;                    // px the knob can travel
+
+          function setKnob(dx, dy) {
+            knob.style.transform = 'translate(' + dx + 'px,' + dy + 'px)';
+          }
+          function fromTouch(t) {
+            const r = zone.getBoundingClientRect();
+            let dx = t.clientX - (r.left + r.width / 2);
+            let dy = t.clientY - (r.top + r.height / 2);
+            const d = Math.hypot(dx, dy);
+            if (d > MAXR) { dx = dx / d * MAXR; dy = dy / d * MAXR; }
+            setKnob(dx, dy);
+            JOY.dx = dx / MAXR;               // -1..1
+            JOY.dy = dy / MAXR;               // -1..1 (screen-down positive)
+          }
+
+          zone.addEventListener('touchstart', e => {
+            const t = e.changedTouches[0];
+            JOY.active = true; JOY.id = t.identifier;
+            fromTouch(t);
+            e.preventDefault();
+          }, { passive: false });
+
+          zone.addEventListener('touchmove', e => {
+            for (const t of e.changedTouches) {
+              if (t.identifier === JOY.id) { fromTouch(t); break; }
+            }
+            e.preventDefault();
+          }, { passive: false });
+
+          function endTouch(e) {
+            for (const t of e.changedTouches) {
+              if (t.identifier === JOY.id) {
+                JOY.active = false; JOY.dx = 0; JOY.dy = 0; JOY.id = null;
+                setKnob(0, 0);
+                break;
+              }
+            }
+          }
+          zone.addEventListener('touchend', endTouch);
+          zone.addEventListener('touchcancel', endTouch);
+        })();
+
+        /* Moves the rig each frame based on joystick input, in the direction
+           the camera is currently facing. */
+        AFRAME.registerComponent('joystick-move', {
+          init: function () {
+            this.speed = 1.6;                 // metres per second
+            this.camEl = this.el.querySelector('[camera]');
+          },
+          tick: function (time, delta) {
+            if (!JOY.active || (JOY.dx === 0 && JOY.dy === 0)) return;
+            if (!this.camEl) return;
+            const dt = delta / 1000;
+            const yaw = this.camEl.object3D.rotation.y;
+            // forward = -Z rotated by yaw; joystick up (negative dy) = forward
+            const fwd = -JOY.dy, strafe = JOY.dx;
+            const sin = Math.sin(yaw), cos = Math.cos(yaw);
+            const mx = (strafe * cos - fwd * sin) * this.speed * dt;
+            const mz = (strafe * sin + fwd * cos) * this.speed * dt;
+            const p = this.el.object3D.position;
+            // keep the doctor inside the ER (room is 14 x 10)
+            p.x = Math.max(-6.4, Math.min(6.4, p.x + mx));
+            p.z = Math.max(-4.4, Math.min(4.4, p.z + mz));
+          }
         });
       </script>
 
     </a-scene>
+
+    <!-- ============ MOBILE VIRTUAL JOYSTICK (touch devices only) ============
+         Hidden by default; shown only when a touch screen is detected and we
+         are NOT in an immersive headset session. Laptop and VR are untouched. -->
+    <div id="joy-zone" style="
+        display:none; position:fixed; left:22px; bottom:22px;
+        width:130px; height:130px; border-radius:50%;
+        background:rgba(11,28,34,0.55); border:2px solid rgba(42,111,133,0.9);
+        touch-action:none; z-index:9999; user-select:none;">
+      <div id="joy-knob" style="
+        position:absolute; left:50%; top:50%; width:56px; height:56px;
+        margin-left:-28px; margin-top:-28px; border-radius:50%;
+        background:rgba(127,233,255,0.85); pointer-events:none;"></div>
+    </div>
+    <div id="joy-hint" style="
+        display:none; position:fixed; left:22px; bottom:158px;
+        color:#9fc3cd; font:12px/1.3 sans-serif; z-index:9999;
+        text-shadow:0 1px 3px #000;">drag to walk</div>
   </body>
 </html>
