@@ -1,0 +1,1303 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>VR ER Triage Simulator</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-extras@7.5.4/dist/aframe-extras.min.js"></script>
+    <script>
+    /* =====================================================================
+       AUDIO ENGINE (user's real ICU recording: 0.10-2.00s normal loop,
+       3.30-8.25s critical loop, playbackRate rises with HR)
+       ===================================================================== */
+    const AudioEngine = {
+      ctx: null, flatlineOsc: null,
+      monitorBuf: null, monitorSrc: null, monitorGain: null, monitorMode: null,
+      init() {
+        if (!this.ctx) this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        if (this.ctx.state === 'suspended') this.ctx.resume();
+      },
+      async loadMonitor(url) {
+        const res = await fetch(url);
+        const ab = await res.arrayBuffer();
+        this.monitorBuf = await this.ctx.decodeAudioData(ab);
+      },
+      startMonitorLoop(mode) {
+        if (!this.monitorBuf) return;
+        this.stopMonitor();
+        const s = this.ctx.createBufferSource();
+        s.buffer = this.monitorBuf; s.loop = true;
+        if (mode === 'normal') { s.loopStart = 0.10; s.loopEnd = 2.00; }
+        else                   { s.loopStart = 3.30; s.loopEnd = 8.25; }
+        const g = this.ctx.createGain(); g.gain.value = 0.55;
+        s.connect(g); g.connect(this.ctx.destination);
+        s.start(0, s.loopStart);
+        this.monitorSrc = s; this.monitorGain = g; this.monitorMode = mode;
+      },
+      setMonitorState(critical, rate) {
+        if (!this.monitorBuf || !this.ctx) return;
+        const mode = critical ? 'critical' : 'normal';
+        if (mode !== this.monitorMode) this.startMonitorLoop(mode);
+        if (this.monitorSrc) this.monitorSrc.playbackRate.value = rate;
+      },
+      stopMonitor() {
+        if (this.monitorSrc) { try { this.monitorSrc.stop(); } catch (e) {} this.monitorSrc = null; }
+        this.monitorMode = null;
+      },
+      beep(freq, dur, vol) {
+        if (!this.ctx) return;
+        const o = this.ctx.createOscillator(); const g = this.ctx.createGain();
+        o.type = 'sine'; o.frequency.value = freq;
+        g.gain.setValueAtTime(vol, this.ctx.currentTime);
+        g.gain.exponentialRampToValueAtTime(0.0001, this.ctx.currentTime + dur);
+        o.connect(g); g.connect(this.ctx.destination);
+        o.start(); o.stop(this.ctx.currentTime + dur);
+      },
+      good() { this.beep(620, 0.1, 0.08); setTimeout(() => this.beep(930, 0.12, 0.08), 110); },
+      bad()  { this.beep(220, 0.25, 0.10); },
+      flatlineStart() {
+        if (!this.ctx || this.flatlineOsc) return;
+        this.stopMonitor();
+        const o = this.ctx.createOscillator(); const g = this.ctx.createGain();
+        o.type = 'sine'; o.frequency.value = 640; g.gain.value = 0.05;
+        o.connect(g); g.connect(this.ctx.destination);
+        o.start(); this.flatlineOsc = o;
+        this.flatlineTimer = setTimeout(() => this.flatlineStop(), 30000);  // auto-stop after 30s
+      },
+      flatlineStop() {
+        if (this.flatlineTimer) { clearTimeout(this.flatlineTimer); this.flatlineTimer = null; }
+        if (this.flatlineOsc) { try { this.flatlineOsc.stop(); } catch (e) {} this.flatlineOsc = null; }
+      },
+      hiss(dur = 1.4) {
+        if (!this.ctx) return;
+        const len = this.ctx.sampleRate * dur;
+        const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+        const data = buf.getChannelData(0);
+        for (let i = 0; i < len; i++) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+        const src = this.ctx.createBufferSource(); const g = this.ctx.createGain();
+        g.gain.value = 0.3; src.buffer = buf;
+        src.connect(g); g.connect(this.ctx.destination); src.start();
+      }
+    };
+
+    /* =====================================================================
+       GAME STATE + DEBRIEF LOG
+       ===================================================================== */
+    const GAME = {
+      phase: 'WELCOME',
+      observeTime: 30,
+      score: 0, decisionsCorrect: 0, decisionsTotal: 0,
+      startTime: null,
+      decomp: { stage: null, site: null },
+      patients: {
+        patientA: { label: 'Ravi',  triage: 'red',    stage: 'triage', saved: false, dead: false },
+        patientB: { label: 'Meena', triage: 'yellow', stage: 'triage', saved: false, dead: false },
+        patientC: { label: 'Arjun', triage: 'green',  stage: 'triage', saved: false, dead: false }
+      }
+    };
+
+    const DEBRIEF = [];   // {topic, ok, why}
+    function logDebrief(topic, ok, why) { DEBRIEF.push({ topic, ok, why }); }
+
+    function addScore(points, correct) {
+      GAME.score += points;
+      GAME.decisionsTotal += 1;
+      if (correct) { GAME.decisionsCorrect += 1; AudioEngine.good(); }
+      else AudioEngine.bad();
+      updateHUD();
+    }
+
+    function setMessage(msg) {
+      const t = document.querySelector('#hud-msg');
+      if (t) t.setAttribute('value', msg);
+      const border = document.querySelector('#hud-border');
+      if (border) {
+        border.setAttribute('color', '#7fe9ff');
+        setTimeout(() => border.setAttribute('color', '#2a6f85'), 350);
+      }
+    }
+    function updateHUD() {
+      const s = document.querySelector('#hud-score');
+      if (s) s.setAttribute('value', 'SCORE ' + GAME.score + '    |    ' + GAME.phase);
+    }
+
+    /* =====================================================================
+       UI PANEL BUILDER
+       ===================================================================== */
+    function clearPanel(id) {
+      const old = document.querySelector('#' + id);
+      if (old) old.parentNode.removeChild(old);
+    }
+
+    function makePanel(id, title, pos, buttons, width, closable) {
+      clearPanel(id);
+      if (closable === undefined) closable = true;
+      const W = width || 1.7;
+      const rowH = 0.19;
+      const titleLines = title.split('\n').length;
+      const titleH = 0.10 + titleLines * 0.075;
+      const H = titleH + buttons.length * rowH + 0.12;
+      const scene = document.querySelector('a-scene');
+      const panel = document.createElement('a-entity');
+      panel.setAttribute('id', id);
+      panel.setAttribute('position', pos);
+
+      const border = document.createElement('a-plane');
+      border.setAttribute('width', W + 0.04); border.setAttribute('height', H + 0.04);
+      border.setAttribute('color', '#2a6f85'); border.setAttribute('opacity', '0.9');
+      border.setAttribute('position', '0 0 -0.002');
+      panel.appendChild(border);
+
+      const bg = document.createElement('a-plane');
+      bg.setAttribute('width', W); bg.setAttribute('height', H);
+      bg.setAttribute('color', '#0b1c22'); bg.setAttribute('opacity', '0.95');
+      panel.appendChild(bg);
+
+      const titleEl = document.createElement('a-text');
+      titleEl.setAttribute('value', title);
+      titleEl.setAttribute('align', 'center');
+      titleEl.setAttribute('color', '#bfeeff');
+      titleEl.setAttribute('width', W * 0.95);
+      titleEl.setAttribute('wrap-count', Math.round(W * 34));
+      titleEl.setAttribute('position', '0 ' + (H / 2 - titleH / 2 - 0.02) + ' 0.01');
+      panel.appendChild(titleEl);
+
+      buttons.forEach((b, i) => {
+        const y = H / 2 - titleH - 0.10 - i * rowH;
+        const btn = document.createElement('a-plane');
+        btn.setAttribute('class', 'clickable');
+        btn.setAttribute('width', W - 0.16);
+        btn.setAttribute('height', rowH - 0.045);
+        btn.setAttribute('position', '0 ' + y + ' 0.01');
+        btn.setAttribute('color', b.color || '#2a5563');
+        btn.dataset.basecolor = b.color || '#2a5563';
+        btn.dataset.selected = 'false';
+
+        const label = document.createElement('a-text');
+        label.setAttribute('value', b.label);
+        label.setAttribute('align', 'center');
+        label.setAttribute('color', '#ffffff');
+        label.setAttribute('width', (W - 0.2) * 1.05);
+        label.setAttribute('wrap-count', Math.round(W * 30));
+        label.setAttribute('position', '0 0 0.01');
+        btn.appendChild(label);
+
+        btn.addEventListener('mouseenter', () => {
+          if (btn.dataset.selected === 'false') btn.setAttribute('color', '#3f7d92');
+        });
+        btn.addEventListener('mouseleave', () => {
+          if (btn.dataset.selected === 'false') btn.setAttribute('color', btn.dataset.basecolor);
+        });
+        btn.addEventListener('click', () => b.onClick(btn));
+        panel.appendChild(btn);
+      });
+
+      if (closable) {
+        const closeBtn = document.createElement('a-plane');
+        closeBtn.setAttribute('class', 'clickable');
+        closeBtn.setAttribute('width', 0.14);
+        closeBtn.setAttribute('height', 0.14);
+        closeBtn.setAttribute('position', (W / 2 - 0.12) + ' ' + (H / 2 - 0.12) + ' 0.015');
+        closeBtn.setAttribute('color', '#8a2a2a');
+        const xText = document.createElement('a-text');
+        xText.setAttribute('value', 'X');
+        xText.setAttribute('align', 'center');
+        xText.setAttribute('color', '#ffffff');
+        xText.setAttribute('width', 1.4);
+        xText.setAttribute('position', '0 0 0.01');
+        closeBtn.appendChild(xText);
+        closeBtn.addEventListener('mouseenter', () => closeBtn.setAttribute('color', '#c93f3f'));
+        closeBtn.addEventListener('mouseleave', () => closeBtn.setAttribute('color', '#8a2a2a'));
+        closeBtn.addEventListener('click', () => clearPanel(id));
+        panel.appendChild(closeBtn);
+      }
+
+      scene.appendChild(panel);
+      refreshRaycasters();
+      return panel;
+    }
+
+    function refreshRaycasters() {
+      setTimeout(() => {
+        document.querySelectorAll('[raycaster]').forEach(r => {
+          if (r.components.raycaster) r.components.raycaster.refreshObjects();
+        });
+      }, 100);
+    }
+
+    /* =====================================================================
+       PHASE 0 — WELCOME
+       ===================================================================== */
+    function showWelcome() {
+      makePanel('panel-welcome',
+        'GOOD EVENING, DOCTOR.\n' +
+        'You are the Emergency Physician on duty tonight.\n' +
+        'Three patients have just arrived in your ER.\n' +
+        'Assess them. Prioritize wisely. Act fast.\n' +
+        'Every second you delay, someone gets worse.',
+        '0 1.75 -1.8',
+        [{ label: '>>> BEGIN SHIFT <<<', color: '#1f6e2a', onClick: () => {
+            AudioEngine.init();
+            AudioEngine.loadMonitor('assets/icu.mp3')
+              .then(() => AudioEngine.startMonitorLoop('normal'))
+              .catch(() => console.warn('icu.mp3 missing'));
+            clearPanel('panel-welcome');
+            GAME.phase = 'OBSERVE';
+            GAME.startTime = Date.now();
+            updateHUD();
+          } }],
+        2.3, false);
+    }
+
+    /* =====================================================================
+       PHASE 2 — PRIORITIZATION (with explanations)
+       ===================================================================== */
+    function startPrioritization() {
+      GAME.phase = 'PRIORITIZE';
+      updateHUD();
+      setMessage('Choose which patient to attend FIRST!');
+      makePanel('panel-priority', 'WHICH PATIENT WILL YOU ATTEND FIRST?', '0 1.7 -1.4', [
+        { label: 'Bed 1 - Ravi (chest injury)',  onClick: () => pickFirst('patientA') },
+        { label: 'Bed 2 - Meena (thigh injury)', onClick: () => pickFirst('patientB') },
+        { label: 'Bed 3 - Arjun (ankle injury)', onClick: () => pickFirst('patientC') }
+      ], 2.0, false);
+    }
+
+    function pickFirst(pid) {
+      clearPanel('panel-priority');
+      if (pid === 'patientA') {
+        addScore(20, true);
+        logDebrief('Prioritization', true, 'Ravi first: SpO2 78, RR 38, BP falling - breathing compromise kills in minutes.');
+        setMessage('Correct! +20. Airway & breathing kill first. Click Ravi to assign triage.');
+      } else if (pid === 'patientB') {
+        addScore(-10, false);
+        logDebrief('Prioritization', false, 'Chose Meena first. Her fracture is urgent but stable; Ravi\'s falling SpO2 and BP mean he dies first without action.');
+        setMessage('Wrong: -10. Pain is loud but hypoxia kills. Ravi\'s SpO2 is 78 and falling!');
+      } else {
+        addScore(-20, false);
+        logDebrief('Prioritization', false, 'Chose Arjun first. A walking, talking patient is by definition the LAST priority.');
+        setMessage('Wrong: -20. He is walking and talking - lowest priority. Ravi is dying!');
+      }
+      GAME.phase = 'TREAT';
+      updateHUD();
+    }
+
+    /* =====================================================================
+       PHASE 3 — TRIAGE (with explanations)
+       ===================================================================== */
+    const bedPanelPos = {
+      patientA: '-4 1.9 -2.4',
+      patientB: '0 1.9 -2.4',
+      patientC: '4 1.9 -2.4'
+    };
+
+    const triageWhy = {
+      patientA: 'RED: hypoxia + tachypnoea + falling BP = immediate life threat.',
+      patientB: 'YELLOW: serious injury, needs treatment soon, but vitals stable.',
+      patientC: 'GREEN: walking wounded - can safely wait.'
+    };
+
+    function openPatientFlow(pid) {
+      if (GAME.phase !== 'TREAT') return;
+      const p = GAME.patients[pid];
+      if (p.dead) { setMessage(p.label + ' has died.'); return; }
+      if (p.stage === 'triage')         showTriagePanel(pid);
+      else if (p.stage === 'examine')   showExamPanel(pid);
+      else if (p.stage === 'orders')    showOrdersPanel(pid);
+      else if (p.stage === 'procedure') showProcedurePanel(pid);
+      else setMessage(p.label + ' already managed.');
+    }
+
+    function showTriagePanel(pid) {
+      const p = GAME.patients[pid];
+      makePanel('panel-flow', 'ASSIGN TRIAGE CATEGORY - ' + p.label, bedPanelPos[pid], [
+        { label: 'RED - Immediate',  color: '#8a1f1f', onClick: () => assignTriage(pid, 'red') },
+        { label: 'YELLOW - Urgent',  color: '#8a6d1f', onClick: () => assignTriage(pid, 'yellow') },
+        { label: 'GREEN - Can wait', color: '#1f6e2a', onClick: () => assignTriage(pid, 'green') }
+      ], 1.8);
+    }
+
+    function assignTriage(pid, chosen) {
+      const p = GAME.patients[pid];
+      const ok = chosen === p.triage;
+      if (ok) {
+        addScore(15, true);
+        setMessage('Correct triage! +15. Now examine ' + p.label + '.');
+      } else {
+        addScore(-15, false);
+        setMessage('Wrong: -15. ' + triageWhy[pid]);
+      }
+      logDebrief('Triage - ' + p.label, ok, triageWhy[pid]);
+      p.stage = 'examine';
+      showExamPanel(pid);   // panel updates in place, no re-click needed
+    }
+
+    /* =====================================================================
+       NEW — EXAMINATION + DIAGNOSIS (player discovers the diagnosis)
+       ===================================================================== */
+    const examConfig = {
+      patientA: {
+        exams: [
+          { label: 'Auscultate chest',   finding: 'ABSENT breath sounds on the RIGHT.' },
+          { label: 'Check trachea',      finding: 'Trachea DEVIATED to the LEFT.' },
+          { label: 'Look at neck veins', finding: 'Neck veins DISTENDED.' },
+          { label: 'Percuss chest',      finding: 'HYPERRESONANT right hemithorax.' }
+        ],
+        dxTitle: 'DIAGNOSIS?\nStab wound + your findings',
+        dx: [
+          { label: 'Tension pneumothorax', correct: true,
+            why: 'Absent breath sounds + tracheal deviation AWAY + distended neck veins + hyperresonance + shock = tension pneumothorax.' },
+          { label: 'Cardiac tamponade', correct: false,
+            why: 'Tamponade gives muffled heart sounds and distended neck veins, but breath sounds are normal and percussion is not hyperresonant.' },
+          { label: 'Massive haemothorax', correct: false,
+            why: 'Haemothorax is DULL to percussion (blood), with FLAT neck veins from blood loss - opposite of these findings.' },
+          { label: 'Simple rib fracture', correct: false,
+            why: 'A simple rib fracture does not cause absent breath sounds, tracheal shift or shock.' }
+        ]
+      },
+      patientB: {
+        exams: [
+          { label: 'Look at the limb',      finding: 'Right thigh swollen, deformed, SHORTENED.' },
+          { label: 'Feel distal pulses',    finding: 'Foot pulses PRESENT, foot warm & pink. Neurovascular intact.' },
+          { label: 'Ask her to lift leg',   finding: 'Unable to lift. Severe pain on any movement.' },
+          { label: 'Compress the pelvis',   finding: 'Pelvis STABLE, non-tender.' }
+        ],
+        dxTitle: 'DIAGNOSIS?\nRTA + your findings',
+        dx: [
+          { label: 'Femoral shaft fracture', correct: true,
+            why: 'Shortened, deformed, swollen thigh after high-energy trauma = femur fracture. Always check distal pulses - and recheck after splinting.' },
+          { label: 'Hip dislocation', correct: false,
+            why: 'Hip dislocation classically gives a flexed, ADDucted, internally rotated limb - not mid-thigh deformity.' },
+          { label: 'Pelvic fracture', correct: false,
+            why: 'Her pelvis is stable and non-tender on examination.' },
+          { label: 'Knee ligament injury', correct: false,
+            why: 'Deformity is in the thigh, not the knee, and ligament injuries do not shorten the limb.' }
+        ]
+      },
+      patientC: {
+        exams: [
+          { label: 'Look at the ankle',        finding: 'Mild swelling below the LATERAL malleolus.' },
+          { label: 'Palpate the malleoli',     finding: 'NO bony tenderness over either malleolus.' },
+          { label: 'Ask him to walk 4 steps',  finding: 'Walks 4 steps with a mild limp.' },
+          { label: 'Feel distal pulses',       finding: 'Pulses normal, foot warm, sensation intact.' }
+        ],
+        dxTitle: 'DIAGNOSIS?\nTwisted ankle + your findings',
+        dx: [
+          { label: 'Lateral ankle sprain', correct: true,
+            why: 'No malleolar bony tenderness + able to weight-bear 4 steps = Ottawa ankle rules NEGATIVE. Clinical sprain, no X-ray needed.' },
+          { label: 'Ankle fracture', correct: false,
+            why: 'Ottawa rules: fracture needs malleolar bony tenderness OR inability to bear weight. He has neither.' },
+          { label: 'Achilles tendon rupture', correct: false,
+            why: 'Achilles rupture presents with a palpable gap and inability to plantarflex - swelling is behind the ankle, not lateral.' },
+          { label: 'Compartment syndrome', correct: false,
+            why: 'Compartment syndrome gives pain out of proportion, tense swelling and later pulse changes - not a mild swelling with normal pulses.' }
+        ]
+      }
+    };
+
+    function showExamPanel(pid) {
+      const cfg = examConfig[pid];
+      const p = GAME.patients[pid];
+      const buttons = cfg.exams.map(ex => ({
+        label: ex.label,
+        onClick: (btn) => {
+          btn.dataset.selected = 'true';
+          btn.setAttribute('color', '#3fa06a');
+          setMessage('FINDING: ' + ex.finding);
+        }
+      }));
+      buttons.push({
+        label: '>>> MAKE DIAGNOSIS <<<', color: '#5a3f92',
+        onClick: () => showDiagnosisPanel(pid)
+      });
+      makePanel('panel-flow', 'EXAMINE - ' + p.label + '\n(perform your examination first)', bedPanelPos[pid], buttons, 1.9);
+    }
+
+    function showDiagnosisPanel(pid) {
+      const cfg = examConfig[pid];
+      const buttons = cfg.dx.map(d => ({
+        label: d.label,
+        onClick: () => {
+          if (d.correct) {
+            addScore(15, true);
+            logDebrief('Diagnosis - ' + GAME.patients[pid].label, true, d.why);
+            GAME.patients[pid].stage = 'orders';
+            setMessage('Correct: ' + d.label + '! +15. Proceed to NURSE ORDERS.');
+            showOrdersPanel(pid);   // panel updates in place, no re-click needed
+          } else {
+            addScore(-10, false);
+            logDebrief('Diagnosis - ' + GAME.patients[pid].label, false, 'Chose ' + d.label + ': ' + d.why);
+            setMessage('Wrong: -10. ' + d.why);
+          }
+        }
+      }));
+      makePanel('panel-flow', cfg.dxTitle, bedPanelPos[pid], buttons, 2.1);
+    }
+
+    /* =====================================================================
+       PHASE 4 — NURSE ORDERS (per-order explanations)
+       ===================================================================== */
+    const ordersConfig = {
+      patientA: {
+        title: 'NURSE ORDERS - Ravi\n(select all needed, then confirm)',
+        options: [
+          { label: 'High-flow oxygen',           correct: true,  why: 'He is severely hypoxic - oxygen buys time while you prepare.' },
+          { label: 'IV access + monitor vitals', correct: true,  why: 'Anticipate deterioration; access before collapse.' },
+          { label: 'Prepare decompression kit',  correct: true,  why: 'Tension pneumothorax needs immediate needle decompression.' },
+          { label: 'Call surgery team',          correct: true,  why: 'He will need a chest drain (definitive) after the needle.' },
+          { label: 'Painkillers only',           correct: false, why: 'Masks symptoms while the pneumothorax keeps tensioning - fatal.' },
+          { label: 'Discharge home',             correct: false, why: 'He is peri-arrest. Discharge would be lethal.' }
+        ]
+      },
+      patientB: {
+        title: 'NURSE ORDERS - Meena\n(select all needed, then confirm)',
+        options: [
+          { label: 'IV line + fluids',        correct: true,  why: 'A femur fracture can bleed 1-1.5 LITRES internally.' },
+          { label: 'Analgesia (pain relief)', correct: true,  why: 'Severe pain - analgesia is humane and lowers physiological stress.' },
+          { label: 'Immobilize limb',         correct: true,  why: 'Reduces pain, bleeding and fat embolism risk.' },
+          { label: 'X-ray right femur',       correct: true,  why: 'Confirms fracture pattern and plans fixation.' },
+          { label: 'Prepare chest tube',      correct: false, why: 'She has no chest pathology - wrong patient, wrong problem.' },
+          { label: 'Discharge home',          correct: false, why: 'An unfixed femur fracture cannot go home.' }
+        ]
+      },
+      patientC: {
+        title: 'NURSE ORDERS - Arjun\n(select all needed, then confirm)',
+        options: [
+          { label: 'Ice pack + elevation',     correct: true,  why: 'Reduces swelling and pain - the R-I-C-E principle.' },
+          { label: 'Crepe bandage / dressing', correct: true,  why: 'Compression supports the sprained ligaments.' },
+          { label: 'Oral analgesics',          correct: true,  why: 'Simple analgesia is sufficient for a sprain.' },
+          { label: 'X-ray ankle',              correct: false, why: 'Ottawa ankle rules NEGATIVE - no bony tenderness, can weight-bear. X-ray adds radiation and cost for nothing.' },
+          { label: 'Prepare intubation',       correct: false, why: 'His airway is fine - he is chatting with you.' },
+          { label: 'Urgent CT scan',           correct: false, why: 'No indication - clinical diagnosis is sufficient.' }
+        ]
+      }
+    };
+
+    function showOrdersPanel(pid) {
+      const cfg = ordersConfig[pid];
+      const selections = new Set();
+      const buttons = cfg.options.map((opt, idx) => ({
+        label: opt.label,
+        onClick: (btn) => {
+          if (selections.has(idx)) {
+            selections.delete(idx);
+            btn.dataset.selected = 'false';
+            btn.setAttribute('color', btn.dataset.basecolor);
+          } else {
+            selections.add(idx);
+            btn.dataset.selected = 'true';
+            btn.setAttribute('color', '#3fa06a');
+          }
+        }
+      }));
+      buttons.push({
+        label: '>>> CONFIRM ORDERS <<<', color: '#5a3f92',
+        onClick: () => confirmOrders(pid, selections)
+      });
+      makePanel('panel-flow', cfg.title, bedPanelPos[pid], buttons, 1.9);
+    }
+
+    function confirmOrders(pid, selections) {
+      const cfg = ordersConfig[pid];
+      const pname = GAME.patients[pid].label;
+      let pts = 0, rightPicks = 0, totalRight = 0, issues = 0;
+      cfg.options.forEach((opt, idx) => {
+        const picked = selections.has(idx);
+        if (opt.correct) totalRight++;
+        if (picked) {
+          pts += opt.correct ? 5 : -5;
+          if (opt.correct) rightPicks++;
+          else { issues++; logDebrief('Order - ' + pname + ': ' + opt.label, false, opt.why); }
+        } else if (opt.correct) {
+          issues++;
+          logDebrief('Missed order - ' + pname + ': ' + opt.label, false, opt.why);
+        }
+      });
+      if (issues === 0) logDebrief('Nurse orders - ' + pname, true, 'All correct orders given, nothing harmful or unnecessary.');
+      const isGood = rightPicks >= Math.ceil(totalRight * 0.75) && pts > 0;
+      addScore(pts, isGood);
+      GAME.patients[pid].stage = 'procedure';
+      setMessage('Orders: ' + (pts >= 0 ? '+' : '') + pts +
+        (issues ? '. ' + issues + ' issue(s) - explained in your debrief.' : '. Flawless!'));
+      showProcedurePanel(pid);   // panel updates in place, no re-click needed
+    }
+
+    /* =====================================================================
+       PHASE 5 — PROCEDURES
+       ===================================================================== */
+    function showProcedurePanel(pid) {
+      if (pid === 'patientA') return decompressionRouter();
+      if (pid === 'patientB') return showSplintChoice();
+      if (pid === 'patientC') {
+        makePanel('panel-flow', 'TREATMENT - Arjun', bedPanelPos.patientC, [
+          { label: 'RICE advice + discharge with analgesia', onClick: () => {
+              clearPanel('panel-flow');
+              addScore(10, true);
+              logDebrief('Disposition - Arjun', true, 'Ottawa-negative sprain: RICE, analgesia, discharge with return advice.');
+              finishPatient('patientC', 'Discharged safely! +10. Rest, Ice, Compression, Elevation.');
+            } },
+          { label: 'Admit to ICU for observation', onClick: () => {
+              addScore(-10, false);
+              logDebrief('Disposition - Arjun', false, 'ICU admission for a sprain wastes a critical-care bed and exposes him to hospital risks.');
+              setMessage('Wrong: -10. A sprain does not need ICU. It blocks a bed someone else may die waiting for.');
+            } }
+        ], 1.9);
+      }
+    }
+
+    /* ---------- SPLINT SELECTION (Meena) ---------- */
+    function showSplintChoice() {
+      makePanel('panel-flow', 'SELECT THE CORRECT SPLINT\nMid-shaft femur fracture', bedPanelPos.patientB, [
+        { label: 'Thomas / traction splint', onClick: () => applySplint() },
+        { label: 'Buddy strapping', onClick: () => {
+            addScore(-10, false);
+            logDebrief('Splint choice', false, 'Buddy strapping is for fingers and toes - useless for a femur.');
+            setMessage('Wrong: -10. Buddy strapping is for fingers/toes.'); } },
+        { label: 'Cervical collar', onClick: () => {
+            addScore(-10, false);
+            logDebrief('Splint choice', false, 'A cervical collar immobilizes the neck, not the femur.');
+            setMessage('Wrong: -10. That is for the neck, not the femur.'); } },
+        { label: 'Below-knee back slab', onClick: () => {
+            addScore(-10, false);
+            logDebrief('Splint choice', false, 'A below-knee slab does not cross the fracture - a splint must immobilize the joint above and below.');
+            setMessage('Wrong: -10. It does not even reach the fracture. Immobilize joint above AND below.'); } }
+      ], 2.0);
+    }
+
+    function applySplint() {
+      clearPanel('panel-flow');
+      const leg = document.querySelector('#patientB');
+      const splint = document.createElement('a-entity');
+      splint.setAttribute('id', 'splintB');
+      splint.innerHTML = `
+        <a-cylinder position="0.02 0.47 0.72" rotation="90 0 0" radius="0.012" height="0.95" color="#b9c2c6" metalness="0.6"></a-cylinder>
+        <a-cylinder position="0.30 0.47 0.72" rotation="90 0 0" radius="0.012" height="0.95" color="#b9c2c6" metalness="0.6"></a-cylinder>
+        <a-torus position="0.16 0.50 0.32" radius="0.13" radius-tubular="0.015" color="#7a8489"></a-torus>
+        <a-box position="0.16 0.50 0.55" width="0.34" height="0.16" depth="0.05" color="#e8e4d8"></a-box>
+        <a-box position="0.16 0.50 0.80" width="0.34" height="0.16" depth="0.05" color="#e8e4d8"></a-box>
+        <a-box position="0.16 0.50 1.05" width="0.34" height="0.16" depth="0.05" color="#e8e4d8"></a-box>
+        <a-box position="0.16 0.46 1.18" width="0.20" height="0.10" depth="0.06" color="#8a9499"></a-box>`;
+      leg.appendChild(splint);
+      addScore(20, true);
+      logDebrief('Splint - Meena', true, 'Traction splint: immobilizes the femur, reduces bleeding into the thigh and pain. Recheck distal pulses after applying!');
+      finishPatient('patientB', 'Traction splint applied! +20. Pulses rechecked - foot still warm and pink.');
+    }
+
+    /* ---------- HANDS-ON NEEDLE DECOMPRESSION (Ravi) ----------
+       help -> oxygen -> position -> site (FPS targeting)
+       -> clean  (GRAB the swab from the bedside tray, RUB the site)
+       -> insert (GRAB the cannula, TOUCH it to the site)
+       -> secure -> done                                              */
+    const decompSites = [
+      { id: 'site-r2ics',  pos: '-0.16 0.68 -0.40', rot: '-90 0 0',
+        label: '2nd ICS\nmidclavicular (R)', correct: true },
+      { id: 'site-r5icsma',pos: '-0.30 0.56 -0.12', rot: '0 0 -90',
+        label: '5th ICS\nmidaxillary (R)',   correct: true },
+      { id: 'site-sternum',pos: '0 0.68 -0.32',     rot: '-90 0 0',
+        label: 'Sternum',                    correct: false },
+      { id: 'site-l2ics',  pos: '0.16 0.68 -0.40',  rot: '-90 0 0',
+        label: '2nd ICS\nmidclavicular (L)', correct: false }
+    ];
+
+    const TOOLS = { held: null, heldType: null, cleaned: false, origParent: null, origPos: null };
+
+    function decompressionRouter() {
+      const st = GAME.decomp.stage;
+      if (!st || st === 'help') return decompStepHelp();
+      if (st === 'oxygen')      return decompStepOxygen();
+      if (st === 'position')    return decompStepPosition();
+      if (st === 'site')        return setMessage('Aim at the correct site on his chest and pull the trigger!');
+      if (st === 'clean')       return setMessage('Grab the SWAB from the tray (trigger), then aim at the green target and pull the trigger again to wipe.');
+      if (st === 'insert')      return setMessage('Grab the 14G CANNULA from the tray (trigger), then aim at the green target and pull the trigger again to insert.');
+      if (st === 'secure')      return decompStepSecure();
+    }
+
+    function decompStepHelp() {
+      GAME.decomp.stage = 'help';
+      makePanel('panel-flow', 'NEEDLE DECOMPRESSION - STEP 1\nTension pneumothorax confirmed.', bedPanelPos.patientA, [
+        { label: 'Call for help + inform team', onClick: () => {
+            addScore(5, true);
+            GAME.decomp.stage = 'oxygen';
+            decompStepOxygen();
+          } }
+      ], 2.0);
+    }
+    function decompStepOxygen() {
+      makePanel('panel-flow', 'STEP 2 - Oxygenation', bedPanelPos.patientA, [
+        { label: 'High-flow O2, 15L non-rebreather mask', onClick: () => {
+            addScore(5, true);
+            GAME.decomp.stage = 'position';
+            decompStepPosition();
+          } }
+      ], 2.0);
+    }
+    function decompStepPosition() {
+      makePanel('panel-flow', 'STEP 3 - Position the patient', bedPanelPos.patientA, [
+        { label: 'Supine, expose the chest fully', onClick: () => {
+            addScore(5, true);
+            clearPanel('panel-flow');
+            GAME.decomp.stage = 'site';
+            spawnSiteTargets();
+            setMessage('STEP 4: Identify the site. Aim at the correct target on his chest and pull the trigger!');
+          } }
+      ], 2.0);
+    }
+
+    function spawnSiteTargets() {
+      const pA = document.querySelector('#patientA');
+      decompSites.forEach(s => {
+        const t = document.createElement('a-entity');
+        t.setAttribute('id', s.id);
+        t.setAttribute('position', s.pos);
+        t.setAttribute('rotation', s.rot);
+        t.innerHTML = `
+          <a-ring class="clickable" color="#ff4444" radius-inner="0.028" radius-outer="0.045"
+                  animation="property: scale; from: 1 1 1; to: 1.25 1.25 1.25; dir: alternate; loop: true; dur: 600"></a-ring>
+          <a-circle class="clickable" color="#ffffff" radius="0.012" position="0 0 0.001"></a-circle>
+          <a-text value="${s.label}" position="0 0.09 0.002" align="center" color="#ffffff" width="0.55"></a-text>`;
+        pA.appendChild(t);
+        setTimeout(() => {
+          t.querySelectorAll('.clickable').forEach(c =>
+            c.addEventListener('click', () => onSiteClick(s)));
+        }, 50);
+      });
+      refreshRaycasters();
+    }
+
+    function onSiteClick(site) {
+      if (GAME.decomp.stage === 'site') {
+        if (site.correct) {
+          addScore(20, true);
+          logDebrief('Decompression site', true, site.label.replace('\n', ' ') +
+            ': correct. ATLS now favours 5th ICS midaxillary in adults (thinner chest wall = fewer failed needles), 2nd ICS MCL remains acceptable.');
+          GAME.decomp.site = site;
+          GAME.decomp.stage = 'clean';
+          decompSites.forEach(s => {
+            const el = document.querySelector('#' + s.id);
+            if (!el) return;
+            if (s.id !== site.id) el.parentNode.removeChild(el);
+            else el.querySelector('a-ring').setAttribute('color', '#3fff7a');
+          });
+          spawnProcedureTray();
+          setMessage('Site confirmed! +20. STEP 5: Grab the SWAB from the tray, aim at the green target, and pull the trigger to wipe.');
+        } else {
+          addScore(-15, false);
+          const why = site.id === 'site-sternum'
+            ? 'Never the sternum - no pleural space there, only heart and great vessels beneath.'
+            : 'Wrong SIDE - his findings are all on the RIGHT. Decompressing the left could collapse his only working lung.';
+          logDebrief('Decompression site', false, why);
+          setMessage('WRONG SITE: -15. ' + why);
+        }
+        return;
+      }
+
+      // acting on the already-confirmed site with whatever tool is in hand
+      if (!GAME.decomp.site || site.id !== GAME.decomp.site.id) return;
+
+      if (GAME.decomp.stage === 'clean') {
+        if (TOOLS.heldType === 'swab') performWipe();
+        else if (TOOLS.heldType === 'cannula') {
+          addScore(-5, false);
+          logDebrief('Asepsis', false, 'Went to puncture without disinfecting - infection risk. Clean the site first.');
+          setMessage('STOP: -5. Disinfect the site with the swab FIRST!');
+        } else if (TOOLS.heldType === 'insulin' || TOOLS.heldType === 'scalpel') {
+          wrongToolPenalty();
+        } else {
+          setMessage('Grab the SWAB from the tray first, then aim here and pull the trigger.');
+        }
+      } else if (GAME.decomp.stage === 'insert') {
+        if (TOOLS.heldType === 'cannula') performInsertion();
+        else if (TOOLS.heldType === 'insulin' || TOOLS.heldType === 'scalpel') wrongToolPenalty();
+        else setMessage('Grab the 14G CANNULA from the tray first, then aim here and pull the trigger.');
+      }
+    }
+
+    function performWipe() {
+      addScore(5, true);
+      logDebrief('Asepsis', true, 'Site disinfected before puncture - clean technique protects against empyema.');
+      const swab = TOOLS.held;
+      TOOLS.held = null; TOOLS.heldType = null;
+      if (swab && swab.parentNode) swab.parentNode.removeChild(swab);
+      TOOLS.cleaned = true;
+      GAME.decomp.stage = 'insert';
+      setMessage('Wiping... Site clean! +5. STEP 6: Grab the 14G CANNULA, aim at the green target, and pull the trigger to insert.');
+    }
+
+    function wrongToolPenalty() {
+      const why = TOOLS.heldType === 'insulin'
+        ? 'An insulin syringe needle is far too short to reach the pleural space.'
+        : 'A scalpel is for surgical thoracostomy, not needle decompression.';
+      addScore(-10, false);
+      logDebrief('Instrument choice', false, why);
+      setMessage('Wrong tool: -10. ' + why + ' It goes back on the tray.');
+      returnHeldTool();
+    }
+
+    /* ---- bedside procedure trolley with graspable tools ---- */
+    function spawnProcedureTray() {
+      const scene = document.querySelector('a-scene');
+      const tray = document.createElement('a-entity');
+      tray.setAttribute('id', 'proc-tray');
+      tray.setAttribute('position', '-5.05 0 -3.85');  // patient's RIGHT side, near the head
+      tray.setAttribute('rotation', '0 55 0');
+      tray.innerHTML = `
+        <a-box position="0 0.86 0" width="0.72" height="0.04" depth="0.42" color="#cfd8db"></a-box>
+        <a-cylinder position="-0.32 0.43 -0.17" radius="0.015" height="0.86" color="#8a9499"></a-cylinder>
+        <a-cylinder position="0.32 0.43 -0.17" radius="0.015" height="0.86" color="#8a9499"></a-cylinder>
+        <a-cylinder position="-0.32 0.43 0.17" radius="0.015" height="0.86" color="#8a9499"></a-cylinder>
+        <a-cylinder position="0.32 0.43 0.17" radius="0.015" height="0.86" color="#8a9499"></a-cylinder>
+        <a-text value="PROCEDURE TRAY" position="0 1.32 0" align="center" color="#1a3c40" width="1.6"></a-text>
+
+        <a-entity id="tool-swab" position="-0.24 0.95 0">
+          <a-cylinder class="clickable" radius="0.014" height="0.18" color="#f5f5f5"></a-cylinder>
+          <a-sphere class="clickable" position="0 0.10 0" radius="0.035" color="#e07a9a"></a-sphere>
+          <a-text value="Swab" position="0 0.20 0" align="center" color="#1a3c40" width="0.8"></a-text>
+        </a-entity>
+
+        <a-entity id="tool-cannula" position="-0.08 0.95 0">
+          <a-cylinder class="clickable" position="0 0.045 0" radius="0.0045" height="0.09" color="#dfe4e6"></a-cylinder>
+          <a-cone class="clickable" position="0 -0.015 0" rotation="180 0 0" radius-bottom="0.016" radius-top="0.007" height="0.035" color="#e8641b"></a-cone>
+          <a-cylinder class="clickable" position="0 -0.05 0" radius="0.013" height="0.03" color="#f0f0f0" opacity="0.9"></a-cylinder>
+          <a-text value="14G cannula" position="0 0.14 0" align="center" color="#1a3c40" width="0.8"></a-text>
+        </a-entity>
+
+        <a-entity id="tool-insulin" position="0.09 0.95 0">
+          <a-cylinder class="clickable" position="0 0.02 0" radius="0.009" height="0.09" color="#eef4f6" opacity="0.9"></a-cylinder>
+          <a-cone class="clickable" position="0 0.085 0" radius-bottom="0.01" radius-top="0.004" height="0.03" color="#e8912b"></a-cone>
+          <a-cylinder class="clickable" position="0 -0.035 0" radius="0.014" height="0.015" color="#dfe4e6"></a-cylinder>
+          <a-text value="Insulin syringe" position="0 0.15 0" align="center" color="#1a3c40" width="0.8"></a-text>
+        </a-entity>
+
+        <a-entity id="tool-scalpel" position="0.26 0.95 0">
+          <a-box class="clickable" position="0 0.01 0" width="0.016" height="0.11" depth="0.008" color="#c8cfd2"></a-box>
+          <a-box class="clickable" position="0 0.085 0" rotation="0 0 12" width="0.02" height="0.045" depth="0.004" color="#eef2f4"></a-box>
+          <a-text value="Scalpel" position="0 0.15 0" align="center" color="#1a3c40" width="0.8"></a-text>
+        </a-entity>
+
+        <!-- reference photos (user's images) lying flat on the tray -->
+        <a-plane position="-0.08 0.885 0.14" rotation="-90 0 0" width="0.13" height="0.13" material="src: #img-cannula; shader: flat"></a-plane>
+        <a-plane position="0.09 0.885 0.14" rotation="-90 0 0" width="0.13" height="0.13" material="src: #img-insulin; shader: flat"></a-plane>
+        <a-plane position="0.26 0.885 0.14" rotation="-90 0 0" width="0.13" height="0.13" material="src: #img-scalpel; shader: flat"></a-plane>`;
+      scene.appendChild(tray);
+      setTimeout(() => {
+        [['tool-swab', 'swab'], ['tool-cannula', 'cannula'],
+         ['tool-insulin', 'insulin'], ['tool-scalpel', 'scalpel']].forEach(([id, type]) => {
+          const toolEl = tray.querySelector('#' + id);
+          toolEl.querySelectorAll('.clickable').forEach(part =>
+            part.addEventListener('click', (evt) => grabTool(toolEl, type, evt)));
+        });
+      }, 50);
+      refreshRaycasters();
+    }
+
+    function grabTool(toolEl, type, evt) {
+      if (TOOLS.held === toolEl) return;
+      returnHeldTool();
+      const hand = (evt.detail && evt.detail.cursorEl) ? evt.detail.cursorEl
+                   : document.querySelector('#rhand');
+      TOOLS.origParent = toolEl.parentNode;
+      TOOLS.origPos = Object.assign({}, toolEl.getAttribute('position'));
+      hand.appendChild(toolEl);
+      toolEl.setAttribute('position', '0 -0.04 -0.15');
+      toolEl.setAttribute('rotation', '-40 0 0');
+      TOOLS.held = toolEl;
+      TOOLS.heldType = type;
+      if (type === 'swab')    setMessage('Holding the swab. Aim at the green target and pull the trigger to wipe.');
+      if (type === 'cannula') setMessage(TOOLS.cleaned
+        ? 'Holding the 14G cannula. Aim at the green target and pull the trigger to insert.'
+        : 'Holding the cannula - but disinfect the site first!');
+      if (type === 'insulin' || type === 'scalpel')
+        setMessage('Holding the ' + (type === 'insulin' ? 'insulin syringe' : 'scalpel') + '... is this the right tool?');
+    }
+
+    function returnHeldTool() {
+      if (!TOOLS.held) return;
+      TOOLS.origParent.appendChild(TOOLS.held);
+      TOOLS.held.setAttribute('position', TOOLS.origPos);
+      TOOLS.held.setAttribute('rotation', '0 0 0');
+      TOOLS.held = null;
+      TOOLS.heldType = null;
+    }
+
+    function performInsertion() {
+      if (GAME.decomp.stage !== 'insert') return;
+      const site = GAME.decomp.site;
+      const el = document.querySelector('#' + site.id);
+      AudioEngine.hiss();
+      if (TOOLS.held && TOOLS.heldType === 'cannula') {
+        TOOLS.held.parentNode.removeChild(TOOLS.held);
+        TOOLS.held = null; TOOLS.heldType = null;
+      }
+      const cannula = document.createElement('a-entity');
+      cannula.innerHTML = `
+        <a-cylinder position="0 0 0.045" rotation="90 0 0" radius="0.004" height="0.06" color="#dfe4e6"></a-cylinder>
+        <a-cone position="0 0 0.095" rotation="-90 0 0" radius-bottom="0.016" radius-top="0.006" height="0.035" color="#e8641b"></a-cone>
+        <a-cylinder position="0 0 0.125" rotation="90 0 0" radius="0.014" height="0.025" color="#f0f0f0" opacity="0.85"></a-cylinder>`;
+      el.appendChild(cannula);
+      el.querySelector('a-ring').setAttribute('visible', 'false');
+      const pA = document.querySelector('#patientA');
+      if (!pA.components.patient.data.dead) {
+        pA.setAttribute('patient', 'treated', true);
+        addScore(15, true);
+        logDebrief('Insertion technique', true, 'Inserted just above the upper border of the rib - the intercostal vessels and nerve run BELOW each rib.');
+        GAME.decomp.stage = 'secure';
+        setMessage('HISSSS... air escapes! +15. SpO2 climbing.');
+        decompStepSecure();   // panel updates in place, no re-click needed
+      }
+    }
+
+    function decompStepSecure() {
+      makePanel('panel-flow', 'FINAL STEP - Decompressed!\nVitals recovering.', bedPanelPos.patientA, [
+        { label: 'Secure cannula + reassess ABCDE', onClick: () => {
+            addScore(5, true);
+            clearPanel('panel-flow');
+            clearPanel('proc-tray');
+            GAME.decomp.stage = 'done';
+            logDebrief('Definitive care', true, 'Needle decompression is TEMPORIZING only - definitive treatment is a chest drain. Surgery team already called. Always reassess after every intervention.');
+            finishPatient('patientA', 'Secured! The needle buys time - the chest drain cures. Surgery is on the way.');
+          } }
+      ], 2.1);
+    }
+
+    function finishPatient(pid, msg) {
+      const p = GAME.patients[pid];
+      p.stage = 'done';
+      p.saved = !p.dead;
+      setMessage(msg);
+      checkEnd();
+    }
+
+    /* =====================================================================
+       END SCREEN + CLINICAL DEBRIEF
+       ===================================================================== */
+    function checkEnd() {
+      const ps = GAME.patients;
+      const allDone = Object.values(ps).every(p => p.stage === 'done' || p.dead);
+      if (!allDone) return;
+      GAME.phase = 'END';
+      updateHUD();
+      showResults();
+    }
+
+    function showResults() {
+      const ps = GAME.patients;
+      const saved = Object.values(ps).filter(p => p.saved).length;
+      const acc = GAME.decisionsTotal ? Math.round(100 * GAME.decisionsCorrect / GAME.decisionsTotal) : 0;
+      const elapsed = Math.round((Date.now() - GAME.startTime) / 1000);
+      let rank = 'Beginner';
+      if (GAME.score >= 160) rank = 'TRAUMA EXPERT';
+      else if (GAME.score >= 115) rank = 'Emergency Physician';
+      else if (GAME.score >= 70) rank = 'Junior Resident';
+
+      makePanel('panel-end',
+        'SHIFT COMPLETE\nPatients saved: ' + saved + '/3' +
+        '\nDecision accuracy: ' + acc + '%' +
+        '\nTotal time: ' + elapsed + 's' +
+        '\nFINAL SCORE: ' + GAME.score +
+        '\nRANK: ' + rank,
+        '0 1.8 -1.6',
+        [
+          { label: 'VIEW CLINICAL DEBRIEF', color: '#5a3f92', onClick: () => showDebriefPage(0) },
+          { label: 'RESTART SIMULATION', onClick: () => location.reload() }
+        ],
+        2.1, false);
+    }
+
+    const DEBRIEF_PER_PAGE = 4;
+    function showDebriefPage(page) {
+      clearPanel('panel-end');
+      const totalPages = Math.max(1, Math.ceil(DEBRIEF.length / DEBRIEF_PER_PAGE));
+      const entries = DEBRIEF.slice(page * DEBRIEF_PER_PAGE, (page + 1) * DEBRIEF_PER_PAGE);
+      const lines = entries.map(e =>
+        (e.ok ? '[GOOD] ' : '[REVIEW] ') + e.topic + '\n' + e.why
+      ).join('\n\n');
+      const title = 'CLINICAL DEBRIEF  (' + (page + 1) + '/' + totalPages + ')\n\n' +
+        (lines || 'No decisions recorded.');
+      const buttons = [];
+      if (page > 0) buttons.push({ label: '< Previous', onClick: () => showDebriefPage(page - 1) });
+      if ((page + 1) * DEBRIEF_PER_PAGE < DEBRIEF.length)
+        buttons.push({ label: 'Next >', onClick: () => showDebriefPage(page + 1) });
+      buttons.push({ label: 'Back to results', onClick: () => { clearPanel('panel-debrief'); showResults(); } });
+      buttons.push({ label: 'RESTART SIMULATION', onClick: () => location.reload() });
+      makePanel('panel-debrief', title, '0 1.8 -1.6', buttons, 2.6, false);
+    }
+
+    /* =====================================================================
+       FLOOR DETAIL
+       ===================================================================== */
+    function buildFloorDetail() {
+      const scene = document.querySelector('a-scene');
+      const mk = (w, h, pos, rot, color) => {
+        const p = document.createElement('a-plane');
+        p.setAttribute('width', w); p.setAttribute('height', h);
+        p.setAttribute('position', pos); p.setAttribute('rotation', rot);
+        p.setAttribute('color', color);
+        scene.appendChild(p);
+      };
+      for (let x = -6; x <= 6; x++) mk(0.02, 10, x + ' 0.002 0', '-90 0 0', '#8f9ea2');
+      for (let z = -4; z <= 4; z++) mk(14, 0.02, '0 0.002 ' + z, '-90 0 0', '#8f9ea2');
+      mk(14, 0.18, '0 0.09 -4.99', '0 0 0', '#5f7276');
+      mk(14, 0.18, '0 0.09 4.99', '0 180 0', '#5f7276');
+      mk(10, 0.18, '-6.99 0.09 0', '0 90 0', '#5f7276');
+      mk(10, 0.18, '6.99 0.09 0', '0 -90 0', '#5f7276');
+    }
+
+    /* =====================================================================
+       A-FRAME COMPONENTS
+       ===================================================================== */
+    AFRAME.registerComponent('patient', {
+      schema: {
+        hr: { default: 80 }, spo2: { default: 98 },
+        bpSys: { default: 120 }, bpDia: { default: 80 }, rr: { default: 14 },
+        deteriorates: { default: false }, treated: { default: false }, dead: { default: false }
+      },
+      init: function () {
+        this.elapsed = 0; this.tickAccum = 0;
+        this.monitor = document.querySelector('#' + this.el.id + '-monitor');
+      },
+      tick: function (time, delta) {
+        if (GAME.phase === 'WELCOME') return;
+        this.tickAccum += delta;
+        if (this.tickAccum < 1000) return;
+        this.tickAccum = 0;
+        this.elapsed += 1;
+        const d = this.data;
+        if (d.deteriorates && !d.treated && !d.dead) this.deteriorate();
+        if (d.treated && !d.dead) this.recover();
+        this.updateMonitor();
+      },
+      deteriorate: function () {
+        const d = this.data;
+        if (this.elapsed <= 70) {
+          d.spo2 = Math.max(60, d.spo2 - 0.28);
+          d.hr = Math.min(150, d.hr + 0.35);
+          d.rr = Math.min(44, d.rr + 0.1);
+        } else if (this.elapsed <= 150) {
+          d.spo2 = Math.max(48, d.spo2 - 0.25);
+          d.hr = Math.min(162, d.hr + 0.2);
+          d.bpSys = Math.max(48, d.bpSys - 0.55);
+          d.bpDia = Math.max(28, d.bpDia - 0.35);
+        } else {
+          d.dead = true;
+          d.hr = 0; d.spo2 = 0; d.bpSys = 0; d.bpDia = 0; d.rr = 0;
+          GAME.patients[this.el.id].dead = true;
+          GAME.patients[this.el.id].stage = 'done';
+          GAME.score -= 50;
+          AudioEngine.flatlineStart();
+          logDebrief('Patient death - Ravi', false, 'Tension pneumothorax untreated for too long: obstructive shock then cardiac arrest. Needle decompression within minutes is life-saving.');
+          setMessage('CARDIAC ARREST - Ravi has died. -50 points.');
+          updateHUD();
+          checkEnd();
+        }
+      },
+      recover: function () {
+        const d = this.data;
+        d.spo2 = Math.min(97, d.spo2 + 0.8);
+        d.hr = Math.max(96, d.hr - 0.8);
+        d.bpSys = Math.min(116, d.bpSys + 0.8);
+        d.bpDia = Math.min(76, d.bpDia + 0.5);
+        d.rr = Math.max(18, d.rr - 0.25);
+      },
+      updateMonitor: function () {
+        if (!this.monitor) return;
+        const d = this.data;
+        const set = (sel, val) => {
+          const el = this.monitor.querySelector(sel);
+          if (el) el.setAttribute('value', val);
+        };
+        set('.hr', d.dead ? 'HR   --- ASYSTOLE' : 'HR   ' + Math.round(d.hr));
+        set('.spo2', 'SpO2 ' + Math.round(d.spo2) + '%');
+        set('.bp', 'BP   ' + Math.round(d.bpSys) + '/' + Math.round(d.bpDia));
+        set('.rr', 'RR   ' + Math.round(d.rr));
+        const frame = this.monitor.querySelector('.frame');
+        const critical = (d.spo2 < 85 || d.bpSys < 80) && !d.dead;
+        if (d.dead) frame.setAttribute('color', '#111111');
+        else if (critical) frame.setAttribute('color', (this.elapsed % 2 === 0) ? '#ff2222' : '#5a0000');
+        else frame.setAttribute('color', '#16323a');
+      }
+    });
+
+    AFRAME.registerComponent('patient-select', {
+      schema: { pid: { default: '' } },
+      init: function () {
+        this.el.addEventListener('click', () => openPatientFlow(this.data.pid));
+      }
+    });
+
+    AFRAME.registerComponent('breathing', {
+      schema: { fast: { default: false } },
+      init: function () {
+        this.el.setAttribute('animation', {
+          property: 'scale', from: '1 1 1', to: '1.02 1.02 1.06',
+          dir: 'alternate', loop: true,
+          dur: this.data.fast ? 700 : 2000, easing: 'easeInOutSine'
+        });
+      }
+    });
+
+    /* =====================================================================
+       GAME MANAGER
+       ===================================================================== */
+    AFRAME.registerComponent('game-manager', {
+      init: function () {
+        this.obsLeft = GAME.observeTime;
+        this.secAccum = 0;
+        updateHUD();
+        setMessage('Welcome, Doctor.');
+        buildFloorDetail();
+        setTimeout(showWelcome, 500);
+      },
+      tick: function (time, delta) {
+        if (GAME.phase === 'WELCOME') return;
+        this.secAccum += delta;
+        if (this.secAccum >= 1000) {
+          this.secAccum = 0;
+          if (GAME.phase === 'OBSERVE') {
+            this.obsLeft -= 1;
+            if (this.obsLeft <= 0) startPrioritization();
+            else setMessage('PHASE 1 - OBSERVATION. Assess all 3 patients. Time left: ' + this.obsLeft + 's');
+          }
+        }
+        const pA = document.querySelector('#patientA');
+        if (!pA || !pA.components.patient) return;
+        const d = pA.components.patient.data;
+        if (d.dead) return;
+        const critical = d.spo2 < 85 || d.bpSys < 80;
+        const rate = Math.min(1.35, Math.max(0.85, 0.8 + (d.hr - 80) * 0.006));
+        AudioEngine.setMonitorState(critical, rate);
+      }
+    });
+    </script>
+  </head>
+
+  <body>
+    <a-scene background="color: #dfeef0" renderer="antialias: true" game-manager>
+
+      <a-assets timeout="10000">
+        <img id="img-cannula" src="assets/cannula.webp" crossorigin="anonymous" />
+        <img id="img-insulin" src="assets/insulin.jpeg" crossorigin="anonymous" />
+        <img id="img-scalpel" src="assets/scalpel.jpg" crossorigin="anonymous" />
+      </a-assets>
+
+      <!-- ==================== ROOM ==================== -->
+      <a-plane rotation="-90 0 0" width="14" height="10" color="#a7b4b8"></a-plane>
+      <a-plane rotation="90 0 0" position="0 3.2 0" width="14" height="10" color="#f4f8f9"></a-plane>
+      <a-plane position="0 1.6 -5" width="14" height="3.2" color="#e8f0f1"></a-plane>
+      <a-plane position="-7 1.6 0" rotation="0 90 0" width="10" height="3.2" color="#dcebec"></a-plane>
+      <a-plane position="7 1.6 0" rotation="0 -90 0" width="10" height="3.2" color="#dcebec"></a-plane>
+      <a-plane position="0 1.6 5" rotation="0 180 0" width="14" height="3.2" color="#e8f0f1"></a-plane>
+
+      <a-box position="-3.5 3.15 -2" width="1.6" height="0.05" depth="0.6" color="#ffffff"
+             material="emissive: #ffffff; emissiveIntensity: 0.7"></a-box>
+      <a-box position="0 3.15 -2" width="1.6" height="0.05" depth="0.6" color="#ffffff"
+             material="emissive: #ffffff; emissiveIntensity: 0.7"></a-box>
+      <a-box position="3.5 3.15 -2" width="1.6" height="0.05" depth="0.6" color="#ffffff"
+             material="emissive: #ffffff; emissiveIntensity: 0.7"></a-box>
+
+      <!-- ============ BED 1 : RAVI ============ -->
+      <a-entity position="-4 0 -3.4">
+        <a-box position="0 0.35 0" width="1.1" height="0.12" depth="2.3" color="#f5f5f5"></a-box>
+        <a-box position="0 0.15 0" width="1.0" height="0.3" depth="2.2" color="#9fb2b6"></a-box>
+        <a-box position="0 0.55 -1.0" width="1.1" height="0.5" depth="0.08" color="#8fa5aa"></a-box>
+        <a-box position="0 0.46 -0.85" width="0.6" height="0.08" depth="0.35" color="#ffffff"></a-box>
+
+        <a-entity id="patientA" patient="hr: 128; spo2: 78; bpSys: 88; bpDia: 54; rr: 38; deteriorates: true">
+          <a-sphere class="clickable" patient-select="pid: patientA" position="0 0.55 -0.82" radius="0.115" color="#c8927a"></a-sphere>
+          <a-cylinder position="0 0.50 -0.70" rotation="90 0 0" radius="0.045" height="0.10" color="#c8927a"></a-cylinder>
+          <a-box class="clickable" patient-select="pid: patientA" breathing="fast: true"
+                 position="0 0.53 -0.33" width="0.42" height="0.20" depth="0.55" color="#c8927a"></a-box>
+          <a-box class="clickable" patient-select="pid: patientA"
+                 position="0 0.50 0.15" width="0.40" height="0.17" depth="0.45" color="#7fb2c9"></a-box>
+          <a-cylinder position="-0.27 0.48 -0.15" rotation="90 0 0" radius="0.045" height="0.65" color="#c8927a"></a-cylinder>
+          <a-cylinder position="0.27 0.48 -0.15" rotation="90 0 0" radius="0.045" height="0.65" color="#c8927a"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientA" position="-0.11 0.46 0.75" rotation="90 0 0" radius="0.06" height="0.85" color="#5f8fa6"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientA" position="0.11 0.46 0.75" rotation="90 0 0" radius="0.06" height="0.85" color="#5f8fa6"></a-cylinder>
+          <a-box position="-0.11 0.47 1.22" width="0.10" height="0.09" depth="0.18" color="#c8927a"></a-box>
+          <a-box position="0.11 0.47 1.22" width="0.10" height="0.09" depth="0.18" color="#c8927a"></a-box>
+        </a-entity>
+
+        <a-entity position="0 2.35 -0.4">
+          <a-plane width="1.5" height="0.62" color="#ffffff"></a-plane>
+          <a-text value="RAVI, 24 M\nStab injury right chest\nSevere breathlessness"
+                  position="0 0 0.01" align="center" color="#1a3c40" width="1.7"></a-text>
+        </a-entity>
+
+        <a-entity id="patientA-monitor" position="0.85 0 -1.35">
+          <a-cylinder position="0 0.7 0" radius="0.025" height="1.4" color="#6a7478"></a-cylinder>
+          <a-box position="0 0.05 0" width="0.4" height="0.06" depth="0.35" color="#5a6468"></a-box>
+          <a-entity position="0 1.55 0" rotation="-8 -20 0">
+            <a-plane class="frame" width="0.95" height="0.75" color="#16323a"></a-plane>
+            <a-plane width="0.87" height="0.67" position="0 0 0.005" color="#020c10"></a-plane>
+            <a-text class="hr"   value="HR   128"  position="-0.38 0.22 0.01" color="#3cf063" width="1.5" anchor="left"></a-text>
+            <a-text class="spo2" value="SpO2 78%"  position="-0.38 0.06 0.01" color="#43d5f0" width="1.5" anchor="left"></a-text>
+            <a-text class="bp"   value="BP   88/54" position="-0.38 -0.10 0.01" color="#f0c243" width="1.5" anchor="left"></a-text>
+            <a-text class="rr"   value="RR   38"   position="-0.38 -0.26 0.01" color="#f0f0f0" width="1.5" anchor="left"></a-text>
+          </a-entity>
+        </a-entity>
+
+        <a-entity position="-0.85 0 -0.9">
+          <a-cylinder position="0 0.9 0" radius="0.02" height="1.8" color="#8a9499"></a-cylinder>
+          <a-cylinder position="0 1.82 0" rotation="0 0 90" radius="0.015" height="0.3" color="#8a9499"></a-cylinder>
+          <a-box position="0.12 1.65 0" width="0.12" height="0.22" depth="0.05" color="#d6ecf5" opacity="0.8"></a-box>
+          <a-cylinder position="0.35 1.05 0.35" rotation="35 25 0" radius="0.004" height="1.3" color="#e8f4f8" opacity="0.7"></a-cylinder>
+        </a-entity>
+      </a-entity>
+
+      <!-- ============ BED 2 : MEENA ============ -->
+      <a-entity position="0 0 -3.4">
+        <a-box position="0 0.35 0" width="1.1" height="0.12" depth="2.3" color="#f5f5f5"></a-box>
+        <a-box position="0 0.15 0" width="1.0" height="0.3" depth="2.2" color="#9fb2b6"></a-box>
+        <a-box position="0 0.55 -1.0" width="1.1" height="0.5" depth="0.08" color="#8fa5aa"></a-box>
+        <a-box position="0 0.46 -0.85" width="0.6" height="0.08" depth="0.35" color="#ffffff"></a-box>
+
+        <a-entity id="patientB" patient="hr: 104; spo2: 97; bpSys: 118; bpDia: 76; rr: 20">
+          <a-sphere class="clickable" patient-select="pid: patientB" position="0 0.55 -0.82" radius="0.11" color="#b9835f"></a-sphere>
+          <a-sphere position="0 0.62 -0.90" radius="0.06" color="#2b1d12"></a-sphere>
+          <a-cylinder position="0 0.50 -0.70" rotation="90 0 0" radius="0.04" height="0.10" color="#b9835f"></a-cylinder>
+          <a-box class="clickable" patient-select="pid: patientB" breathing
+                 position="0 0.52 -0.30" width="0.40" height="0.18" depth="0.5" color="#c9a24f"></a-box>
+          <a-box class="clickable" patient-select="pid: patientB"
+                 position="0 0.50 0.12" width="0.38" height="0.16" depth="0.4" color="#c9a24f"></a-box>
+          <a-cylinder position="-0.26 0.48 -0.15" rotation="90 0 0" radius="0.04" height="0.6" color="#b9835f"></a-cylinder>
+          <a-cylinder position="0.26 0.48 -0.15" rotation="90 0 0" radius="0.04" height="0.6" color="#b9835f"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientB" position="-0.11 0.46 0.72" rotation="90 0 0" radius="0.055" height="0.8" color="#c9a24f"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientB" position="0.16 0.47 0.55" rotation="90 14 6" radius="0.055" height="0.45" color="#c9a24f"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientB" position="0.20 0.45 0.95" rotation="90 -8 0" radius="0.05" height="0.4" color="#c9a24f"></a-cylinder>
+          <a-box position="-0.11 0.47 1.16" width="0.09" height="0.08" depth="0.16" color="#b9835f"></a-box>
+          <a-box position="0.21 0.46 1.18" width="0.09" height="0.08" depth="0.16" color="#b9835f"></a-box>
+        </a-entity>
+
+        <a-entity position="0 2.35 -0.4">
+          <a-plane width="1.5" height="0.62" color="#ffffff"></a-plane>
+          <a-text value="MEENA, 36 F\nRTA - right thigh deformity\nSevere pain, conscious"
+                  position="0 0 0.01" align="center" color="#1a3c40" width="1.7"></a-text>
+        </a-entity>
+
+        <a-entity id="patientB-monitor" position="0.85 0 -1.35">
+          <a-cylinder position="0 0.7 0" radius="0.025" height="1.4" color="#6a7478"></a-cylinder>
+          <a-box position="0 0.05 0" width="0.4" height="0.06" depth="0.35" color="#5a6468"></a-box>
+          <a-entity position="0 1.55 0" rotation="-8 -20 0">
+            <a-plane class="frame" width="0.95" height="0.75" color="#16323a"></a-plane>
+            <a-plane width="0.87" height="0.67" position="0 0 0.005" color="#020c10"></a-plane>
+            <a-text class="hr"   value="HR   104"   position="-0.38 0.22 0.01" color="#3cf063" width="1.5" anchor="left"></a-text>
+            <a-text class="spo2" value="SpO2 97%"   position="-0.38 0.06 0.01" color="#43d5f0" width="1.5" anchor="left"></a-text>
+            <a-text class="bp"   value="BP   118/76" position="-0.38 -0.10 0.01" color="#f0c243" width="1.5" anchor="left"></a-text>
+            <a-text class="rr"   value="RR   20"    position="-0.38 -0.26 0.01" color="#f0f0f0" width="1.5" anchor="left"></a-text>
+          </a-entity>
+        </a-entity>
+
+        <a-entity position="-0.85 0 -0.9">
+          <a-cylinder position="0 0.9 0" radius="0.02" height="1.8" color="#8a9499"></a-cylinder>
+          <a-cylinder position="0 1.82 0" rotation="0 0 90" radius="0.015" height="0.3" color="#8a9499"></a-cylinder>
+          <a-box position="0.12 1.65 0" width="0.12" height="0.22" depth="0.05" color="#d6ecf5" opacity="0.8"></a-box>
+        </a-entity>
+      </a-entity>
+
+      <!-- ============ BED 3 : ARJUN ============ -->
+      <a-entity position="4 0 -3.4">
+        <a-box position="0 0.35 0" width="1.1" height="0.12" depth="2.3" color="#f5f5f5"></a-box>
+        <a-box position="0 0.15 0" width="1.0" height="0.3" depth="2.2" color="#9fb2b6"></a-box>
+        <a-box position="0 0.55 -1.0" width="1.1" height="0.5" depth="0.08" color="#8fa5aa"></a-box>
+
+        <a-entity id="patientC" patient="hr: 82; spo2: 99; bpSys: 122; bpDia: 78; rr: 14">
+          <a-sphere class="clickable" patient-select="pid: patientC" position="0.62 1.12 0.35" radius="0.105" color="#caa284"></a-sphere>
+          <a-cylinder position="0.62 1.00 0.35" radius="0.04" height="0.08" color="#caa284"></a-cylinder>
+          <a-box class="clickable" patient-select="pid: patientC" breathing
+                 position="0.62 0.80 0.35" width="0.34" height="0.36" depth="0.20" color="#5aa06a"></a-box>
+          <a-cylinder position="0.44 0.78 0.35" rotation="0 0 18" radius="0.035" height="0.4" color="#caa284"></a-cylinder>
+          <a-cylinder position="0.80 0.78 0.35" rotation="0 0 -18" radius="0.035" height="0.4" color="#caa284"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientC" position="0.62 0.58 0.50" rotation="70 0 0" radius="0.05" height="0.35" color="#3a4a5a"></a-cylinder>
+          <a-cylinder class="clickable" patient-select="pid: patientC" position="0.62 0.30 0.62" radius="0.045" height="0.45" color="#3a4a5a"></a-cylinder>
+          <a-cylinder position="0.62 0.10 0.62" radius="0.055" height="0.10" color="#f0ede4"></a-cylinder>
+        </a-entity>
+
+        <a-entity position="0 2.35 -0.4">
+          <a-plane width="1.5" height="0.62" color="#ffffff"></a-plane>
+          <a-text value="ARJUN, 19 M\nTwisted ankle (football)\nWalking, talking normally"
+                  position="0 0 0.01" align="center" color="#1a3c40" width="1.7"></a-text>
+        </a-entity>
+
+        <a-entity id="patientC-monitor" position="0.85 0 -1.35">
+          <a-cylinder position="0 0.7 0" radius="0.025" height="1.4" color="#6a7478"></a-cylinder>
+          <a-box position="0 0.05 0" width="0.4" height="0.06" depth="0.35" color="#5a6468"></a-box>
+          <a-entity position="0 1.55 0" rotation="-8 -20 0">
+            <a-plane class="frame" width="0.95" height="0.75" color="#16323a"></a-plane>
+            <a-plane width="0.87" height="0.67" position="0 0 0.005" color="#020c10"></a-plane>
+            <a-text class="hr"   value="HR   82"    position="-0.38 0.22 0.01" color="#3cf063" width="1.5" anchor="left"></a-text>
+            <a-text class="spo2" value="SpO2 99%"   position="-0.38 0.06 0.01" color="#43d5f0" width="1.5" anchor="left"></a-text>
+            <a-text class="bp"   value="BP   122/78" position="-0.38 -0.10 0.01" color="#f0c243" width="1.5" anchor="left"></a-text>
+            <a-text class="rr"   value="RR   14"    position="-0.38 -0.26 0.01" color="#f0f0f0" width="1.5" anchor="left"></a-text>
+          </a-entity>
+        </a-entity>
+      </a-entity>
+
+      <!-- ==================== NURSE ==================== -->
+      <a-entity id="nurse" position="2.2 0 -1.6" rotation="0 -150 0">
+        <a-cylinder position="-0.08 0.42 0" radius="0.055" height="0.84" color="#1f4e63"></a-cylinder>
+        <a-cylinder position="0.08 0.42 0" radius="0.055" height="0.84" color="#1f4e63"></a-cylinder>
+        <a-box position="0 1.08 0" width="0.36" height="0.5" depth="0.2" color="#2d8a94"></a-box>
+        <a-cylinder position="-0.24 1.08 0" rotation="0 0 12" radius="0.04" height="0.46" color="#2d8a94"></a-cylinder>
+        <a-cylinder position="0.24 1.08 0" rotation="0 0 -12" radius="0.04" height="0.46" color="#2d8a94"></a-cylinder>
+        <a-sphere position="-0.28 0.83 0" radius="0.04" color="#c8927a"></a-sphere>
+        <a-sphere position="0.28 0.83 0" radius="0.04" color="#c8927a"></a-sphere>
+        <a-sphere position="0 1.48 0" radius="0.105" color="#c8927a"></a-sphere>
+        <a-sphere position="0 1.50 -0.03" radius="0.105" color="#3a2a1a"></a-sphere>
+        <a-sphere position="0 1.47 0.035" radius="0.095" color="#c8927a"></a-sphere>
+        <a-cylinder position="0 1.60 0" radius="0.075" height="0.045" color="#ffffff"></a-cylinder>
+        <a-plane position="0.10 1.18 0.105" width="0.06" height="0.08" color="#ffffff"></a-plane>
+        <a-text value="NURSE" position="0 1.78 0" align="center" color="#1a3c40" width="2.2"></a-text>
+      </a-entity>
+
+      <!-- ==================== LIGHTING ==================== -->
+      <a-light type="ambient" intensity="0.75"></a-light>
+      <a-light type="directional" position="3 5 2" intensity="0.55"></a-light>
+
+      <!-- ==================== PLAYER RIG + FACE HUD ==================== -->
+      <a-entity id="rig" movement-controls="speed: 0.18" position="0 0 2">
+        <a-entity camera position="0 1.6 0" look-controls>
+          <a-entity id="hud" position="0 -0.30 -0.85" rotation="-12 0 0">
+            <a-plane id="hud-border" width="0.56" height="0.245" color="#2a6f85" opacity="0.9"></a-plane>
+            <a-plane width="0.54" height="0.225" position="0 0 0.002" color="#0b1c22" opacity="0.93"></a-plane>
+            <a-plane width="0.54" height="0.055" position="0 0.085 0.003" color="#123039" opacity="0.95"></a-plane>
+            <a-text id="hud-score" value="SCORE 0    |    WELCOME"
+                    position="0 0.085 0.006" align="center" color="#7fe9ff"
+                    width="0.62" wrap-count="34"></a-text>
+            <a-plane width="0.50" height="0.004" position="0 0.055 0.004" color="#2a6f85"></a-plane>
+            <a-text id="hud-msg" value="Loading..."
+                    position="0 -0.028 0.006" align="center" color="#eafcff"
+                    width="0.55" wrap-count="34" baseline="center"></a-text>
+          </a-entity>
+
+          <!-- Desktop-click / mobile-tap reticle: same raycaster + click events as
+               the VR laser controllers, but aimed by looking (mouse-drag or phone
+               tilt) and fired with a mouse click or screen tap. Auto-hides once a
+               real VR headset session starts, since the laser controllers take
+               over at that point. -->
+          <a-entity id="gaze-cursor"
+                    cursor="fuse: false; rayOrigin: mouse"
+                    raycaster="objects: .clickable; far: 8"
+                    geometry="primitive: ring; radiusInner: 0.006; radiusOuter: 0.010"
+                    material="color: #7fe9ff; shader: flat; opacity: 0.9"
+                    position="0 0 -0.6"></a-entity>
+        </a-entity>
+
+        <a-entity id="lhand" laser-controls="hand: left" raycaster="objects: .clickable; far: 8"></a-entity>
+        <a-entity id="rhand" laser-controls="hand: right" raycaster="objects: .clickable; far: 8"></a-entity>
+      </a-entity>
+
+      <script>
+        // Hide the flatscreen reticle once real VR starts, restore it if VR exits.
+        document.querySelector('a-scene').addEventListener('enter-vr', () => {
+          const gc = document.querySelector('#gaze-cursor');
+          if (gc) gc.setAttribute('visible', 'false');
+        });
+        document.querySelector('a-scene').addEventListener('exit-vr', () => {
+          const gc = document.querySelector('#gaze-cursor');
+          if (gc) gc.setAttribute('visible', 'true');
+        });
+      </script>
+
+    </a-scene>
+  </body>
+</html>
